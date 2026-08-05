@@ -1,0 +1,34 @@
+{
+    "id": "69dd3972-7864-4e52-9fe6-4d1157d13389",
+    "created": 1785567425892,
+    "license": "MIT",
+    "authorName": "pandur",
+    "dependencies": [
+        {
+            "src": "@modelcontextprotocol/sdk",
+            "type": "npm"
+        },
+        {
+            "src": "zod",
+            "type": "npm"
+        }
+    ],
+    "layout": {
+        "portsIn": [
+            {
+                "type": 1,
+                "name": "update"
+            }
+        ],
+        "portsOut": [
+            {
+                "type": 2,
+                "name": "Data"
+            },
+            {
+                "type": 5,
+                "name": "Log"
+            }
+        ]
+    }
+}
