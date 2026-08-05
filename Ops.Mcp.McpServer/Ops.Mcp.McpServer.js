@@ -4,18 +4,13 @@ const http = op.require("node:http");
 const { z } = op.require("zod");
 
 const
-    inData = op.inTriggerButton("update"),
-    outData = op.outObject("Data"),
-  outLog=op.outString("Log");
+    outStarted = op.outBoolNum("Started", false),
+    outData = op.outObject("Last Request Data"),
+    outLog = op.outString("Log");
 
-let log="";
-let logCount=0
+let log = "";
+let logCount = 0;
 buildMcpServer();
-
-inData.onTriggered = () =>
-{
-    outData.set(getOpenTabData());
-};
 
 function getOpenTabData()
 {
@@ -46,66 +41,65 @@ function getOpenTabData()
 
 function logMcp(_log)
 {
-  log=log+logCount+": "+_log+"\n";
-  logCount++;
-  outLog.set(log)
+    log = log + logCount + ": " + _log + "\n";
+    logCount++;
+    outLog.set(log);
 }
 
-const s=new CABLES.UI.OpSearch()
-s.buildList()
+const s = new CABLES.UI.OpSearch();
+s.buildList();
 
 function buildMcpServer()
 {
     const server = new McpServer.McpServer({ "name": "cables standalone mcp server", "version": "1.0.0" });
 
+    console.log("server", server);
     server.tool(
         "get-opened-resources",
         "get currently opened files",
         { },
         () =>
         {
-          logMcp("get-opened-resources");
+            logMcp("get-opened-resources");
 
             const data = { "content": [] };
             data.content = getOpenTabData();
 
-outData.setRef({data:data})
+            outData.setRef({ "data": data });
             return data;
         }
     );
 
-
-
-  server.tool(
-      "edit-op",
+    server.tool(
+        "edit-op",
         "open an op to edit and change it",
-        { opname:z.string()},
+        { "opname": z.string() },
         (opts) =>
         {
 
-           gui.serverOps.edit(opts.opname, false, null, true);
-            const data = { "content":[] };
+            gui.serverOps.edit(opts.opname, false, null, true);
+            const data = { "content": [] };
 
-outData.setRef({data:data})
+            outData.setRef({ "data": data });
             return data;
         }
     );
 
-
-  server.tool(
-      "search-ops",
+    server.tool(
+        "search-ops",
         "search through a list of all available ops",
-        { str:z.string()},
+        { "str": z.string() },
         (str) =>
         {
-          logMcp("search ops: "+str.str);
-s.search(str.str)
-            const data = { "content":[] };
-for(let i=0;i<s.list.length;i++){
-if(s.list[i].score>0)data.content.push({type:"text",text:s.list[i].name+": "+s.list[i].summary})
-  }
+            logMcp("search ops: " + str.str);
+            s.search(str.str);
+            const data = { "content": [] };
+            for (let i = 0; i < s.list.length; i++)
+            {
+                if (s.list[i].score > 0)data.content.push({ "type": "text", "text": s.list[i].name + ": " + s.list[i].summary });
+            }
 
-outData.setRef({data:data})
+            outData.setRef({ "data": data });
             // data.content = getOpenTabData();
             return data;
         }
@@ -118,7 +112,7 @@ outData.setRef({data:data})
         ({ uri, text }) =>
         {
 
-          logMcp("set-opened-resources "+uri);
+            logMcp("set-opened-resources " + uri);
             let found = false;
             for (let i = 0; i < gui.mainTabs.tabs.length; i++)
             {
@@ -134,7 +128,7 @@ outData.setRef({data:data})
 
             const data = { "content": [{ "type": "text", "text": found ? "content updated" : "no opened file matches uri " + uri }] };
 
-outData.setRef({data:data})
+            outData.setRef({ "data": data });
             return data;
         }
     );
@@ -168,6 +162,7 @@ setTimeout(() =>
     httpServer.listen(3000, () =>
     {
         console.log("MCP server listening on http://localhost:3000/mcp");
+        outStarted.set(true);
     });
 
 }, 500);
@@ -178,5 +173,4 @@ op.onDelete = () =>
     {
         console.log("Server closed");
     });
-
 };
