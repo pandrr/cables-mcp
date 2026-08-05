@@ -7,7 +7,7 @@ USE WITH CAUTION
 #### how to install op
 
 - check out this repository
-- start cables standalone
+- start cables standalone (min v0.11.1 or self build)
 - add folder of this repository as an op dir
 - you should be able to use McpServer op now
 - open op code editor by pressing [e] and then you should be able to chat about this code
