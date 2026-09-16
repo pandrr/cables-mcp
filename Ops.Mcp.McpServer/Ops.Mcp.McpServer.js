@@ -64,7 +64,7 @@ function getOpSource(opname)
     });
 }
 
-// resolves any uri this server hands out (mcpfile:/// or cables://op/) to { mimeType, text }
+// resolves any uri this server hands out (mcpfile:/// or cables://op/ or cables://patch.json) to { mimeType, text }
 async function readResourceContent(uri)
 {
     if (uri.startsWith("mcpfile:///"))
@@ -77,6 +77,10 @@ async function readResourceContent(uri)
     {
         const code = await getOpSource(uri.replace("cables://op/", ""));
         return { "mimeType": "application/javascript", "text": code };
+    }
+    if (uri === "cables://patch.json")
+    {
+        return { "mimeType": "application/json", "text": JSON.stringify(op.patch.serialize()) };
     }
     throw new Error("unsupported uri " + uri);
 }
@@ -117,6 +121,19 @@ function buildMcpServer()
     );
 
     server.registerResource(
+        "patch json",
+        new McpServer.ResourceTemplate("cables://patch.json", { "list": undefined }),
+        { "description": "read-only structure and data of the current patch" },
+        async (uri) =>
+        {
+             const content= op.patch.serialize() ;
+            const data = { "contents": [{ "uri": uri.href, ...content }] };
+            outData.setRef({ "data": data });
+            return data;
+        }
+    );
+
+    server.registerResource(
         "op-source",
         new McpServer.ResourceTemplate("cables://op/{opname}", { "list": undefined }),
         { "description": "read-only source code of a cables op; get op names from search-ops" },
@@ -148,7 +165,7 @@ function buildMcpServer()
 
     server.tool(
         "read-resource",
-        "read a resource by uri (mcpfile:///<name> or cables://op/<opname>)",
+        "read a resource by uri (mcpfile:///<name>, cables://op/<opname>, or cables://patch.json)",
         { "uri": z.string() },
         async ({ uri }) =>
         {
@@ -218,6 +235,38 @@ function buildMcpServer()
 
             const data = { "content": [{ "type": "text", "text": tab ? "content updated" : "no opened file matches uri " + uri }] };
 
+            outData.setRef({ "data": data });
+            return data;
+        }
+    );
+
+    server.tool(
+        "set-port-value",
+        "set the value of a port on an op in the current patch; identify the op by its id and the port by its name (see get-patch / cables://patch.json for op ids and port names)",
+        { "opId": z.string(), "portName": z.string(), "value": z.any() },
+        ({ opId, portName, value }) =>
+        {
+            logMcp("set-port-value " + opId + "." + portName);
+
+            const targetOp = op.patch.getOpById(opId);
+            if (!targetOp)
+            {
+                const data = { "content": [{ "type": "text", "text": "no op found with id " + opId }] };
+                outData.setRef({ "data": data });
+                return data;
+            }
+
+            const port = targetOp.getPort(portName);
+            if (!port)
+            {
+                const data = { "content": [{ "type": "text", "text": "no port named \"" + portName + "\" on op " + opId }] };
+                outData.setRef({ "data": data });
+                return data;
+            }
+
+            port.set(value);
+
+            const data = { "content": [{ "type": "text", "text": "set " + opId + "." + portName + " = " + JSON.stringify(value) }] };
             outData.setRef({ "data": data });
             return data;
         }
