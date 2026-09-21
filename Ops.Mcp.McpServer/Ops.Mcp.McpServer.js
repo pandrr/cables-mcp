@@ -6,7 +6,7 @@ const { z } = op.require("zod");
 const
     outStarted = op.outBoolNum("Started", false),
     outData = op.outObject("Last Request Data"),
-    outLog = op.outString("Log");
+    outLog = op.outString("Log","");
 
 let log = "";
 let logCount = 0;
@@ -90,6 +90,55 @@ function logMcp(_log)
     log = log + logCount + ": " + _log + "\n";
     logCount++;
     outLog.set(log);
+}
+
+// returns the current content of the rendering canvas as base64 png (without data: prefix),
+// optionally downscaled to maxWidth to keep the image small
+function captureCanvas(maxWidth)
+{
+    const canvas = CABLES.patch.cgl.canvas;
+    if (!canvas) throw new Error("no rendering canvas found at CABLES.patch.cgl.canvas");
+
+    let source = canvas;
+    if (maxWidth && canvas.width > maxWidth)
+    {
+        source = document.createElement("canvas");
+        source.width = Math.round(maxWidth);
+        source.height = Math.max(1, Math.round(canvas.height * maxWidth / canvas.width));
+        source.getContext("2d").drawImage(canvas, 0, 0, source.width, source.height);
+    }
+
+    return source.toDataURL("image/png").split(",")[1];
+}
+
+// waits for the end of the next rendered frame so the canvas holds a complete image;
+// falls back to capturing right away if no frame arrives (e.g. patch is paused)
+function grabScreenshot(maxWidth)
+{
+    return new Promise((resolve, reject) =>
+    {
+        const cgl = CABLES.patch.cgl;
+        let done = false;
+        let listener = null;
+        let timeout = null;
+
+        const finish = () =>
+        {
+            if (done) return;
+            done = true;
+            clearTimeout(timeout);
+
+            // capture synchronously, still inside the frame; removing the listener while
+            // emitEvent is iterating could skip other listeners, so do that afterwards
+            try { resolve(captureCanvas(maxWidth)); }
+            catch (e) { reject(e); }
+
+            if (listener) setTimeout(() => { cgl.off(listener); }, 0);
+        };
+
+        listener = cgl.on("endframe", finish);
+        timeout = setTimeout(finish, 1000);
+    });
 }
 
 const s = new CABLES.UI.OpSearch();
@@ -256,6 +305,8 @@ function buildMcpServer()
                 return data;
             }
 
+
+
             const port = targetOp.getPort(portName);
             if (!port)
             {
@@ -266,7 +317,33 @@ function buildMcpServer()
 
             port.set(value);
 
+if(CABLES.UI&&gui.patchView.isCurrentOp(targetOp)) targetOp.refreshParams();
+
             const data = { "content": [{ "type": "text", "text": "set " + opId + "." + portName + " = " + JSON.stringify(value) }] };
+            outData.setRef({ "data": data });
+            return data;
+        }
+    );
+
+    server.tool(
+        "screenshot",
+        "take a screenshot of the patch's rendering canvas (CABLES.patch.cgl.canvas) and return it as a png image; use it to check what a change looks like. maxWidth downscales the image (default 1024)",
+        { "maxWidth": z.number().optional() },
+        async ({ maxWidth }) =>
+        {
+            logMcp("screenshot");
+
+            let data;
+            try
+            {
+                const png = await grabScreenshot(maxWidth || 1024);
+                data = { "content": [{ "type": "image", "data": png, "mimeType": "image/png" }] };
+            }
+            catch (e)
+            {
+                data = { "content": [{ "type": "text", "text": "screenshot failed: " + e.message }], "isError": true };
+            }
+
             outData.setRef({ "data": data });
             return data;
         }
