@@ -13,6 +13,9 @@ let logCount = 0;
 let currentServer = null;
 buildMcpServer();
 
+
+console.log("hello");
+
 function urlName(name)
 {
     return name.replace(/ /g, "_");
@@ -232,7 +235,6 @@ function buildMcpServer()
         { "opname": z.string() },
         (opts) =>
         {
-
             gui.serverOps.edit(opts.opname, false, null, true);
             const data = { "content": [] };
 
@@ -305,8 +307,6 @@ function buildMcpServer()
                 return data;
             }
 
-
-
             const port = targetOp.getPort(portName);
             if (!port)
             {
@@ -317,7 +317,7 @@ function buildMcpServer()
 
             port.set(value);
 
-if(CABLES.UI&&gui.patchView.isCurrentOp(targetOp)) targetOp.refreshParams();
+            if(CABLES.UI&&gui.patchView.isCurrentOp(targetOp)) targetOp.refreshParams();
 
             const data = { "content": [{ "type": "text", "text": "set " + opId + "." + portName + " = " + JSON.stringify(value) }] };
             outData.setRef({ "data": data });
@@ -326,8 +326,173 @@ if(CABLES.UI&&gui.patchView.isCurrentOp(targetOp)) targetOp.refreshParams();
     );
 
     server.tool(
+        "trigger-port",
+        "trigger/execute a trigger-type port on an op directly, without needing anything connected to it; identify the op by its id and the port by its name (see cables://patch.json for op ids and port names). fails if the port is not a trigger port.",
+        { "opId": z.string(), "portName": z.string() },
+        ({ opId, portName }) =>
+        {
+            logMcp("trigger-port " + opId + "." + portName);
+
+            const targetOp = CABLES.patch.getOpById(opId);
+            if (!targetOp)
+            {
+                const data = { "content": [{ "type": "text", "text": "no op found with id " + opId }], "isError": true };
+                outData.setRef({ "data": data });
+                return data;
+            }
+
+            const port = targetOp.getPort(portName);
+            if (!port)
+            {
+                const data = { "content": [{ "type": "text", "text": "no port named \"" + portName + "\" on op " + opId }], "isError": true };
+                outData.setRef({ "data": data });
+                return data;
+            }
+
+            if (port.getType() !== CABLES.Port.TYPE_TRIGGER)
+            {
+                const data = { "content": [{ "type": "text", "text": "port \"" + portName + "\" on op " + opId + " is not a trigger port" }], "isError": true };
+                outData.setRef({ "data": data });
+                return data;
+            }
+
+            // .trigger() only forwards along the port's own links, which is a no-op for a
+            // port that has nothing wired to it. _onTriggered() is what the cables editor's
+            // own UI calls when clicking a trigger button (params_listener.js) - it fires the
+            // op's onTriggered handler directly, regardless of whether anything is linked.
+            port._onTriggered();
+
+            if (CABLES.UI && gui.patchView.isCurrentOp(targetOp)) targetOp.refreshParams();
+
+            const data = { "content": [{ "type": "text", "text": "triggered " + opId + "." + portName }] };
+            outData.setRef({ "data": data });
+            return data;
+        }
+    );
+
+    server.tool(
+        "link-ports",
+        "connect (link) an output port of one op to an input port of another op in the current patch; identify ops by id and ports by name (see cables://patch.json for op ids and port names)",
+        { "opId1": z.string(), "portName1": z.string(), "opId2": z.string(), "portName2": z.string() },
+        ({ opId1, portName1, opId2, portName2 }) =>
+        {
+            logMcp("link-ports " + opId1 + "." + portName1 + " -> " + opId2 + "." + portName2);
+
+            const op1 = CABLES.patch.getOpById(opId1);
+            if (!op1)
+            {
+                const data = { "content": [{ "type": "text", "text": "no op found with id " + opId1 }], "isError": true };
+                outData.setRef({ "data": data });
+                return data;
+            }
+
+            const op2 = CABLES.patch.getOpById(opId2);
+            if (!op2)
+            {
+                const data = { "content": [{ "type": "text", "text": "no op found with id " + opId2 }], "isError": true };
+                outData.setRef({ "data": data });
+                return data;
+            }
+
+            if (!op1.getPort(portName1))
+            {
+                const data = { "content": [{ "type": "text", "text": "no port named \"" + portName1 + "\" on op " + opId1 }], "isError": true };
+                outData.setRef({ "data": data });
+                return data;
+            }
+
+            if (!op2.getPort(portName2))
+            {
+                const data = { "content": [{ "type": "text", "text": "no port named \"" + portName2 + "\" on op " + opId2 }], "isError": true };
+                outData.setRef({ "data": data });
+                return data;
+            }
+
+            const link = CABLES.patch.link(op1, portName1, op2, portName2);
+
+            const data = link
+                ? { "content": [{ "type": "text", "text": "linked " + opId1 + "." + portName1 + " -> " + opId2 + "." + portName2 }] }
+                : { "content": [{ "type": "text", "text": "could not link " + opId1 + "." + portName1 + " -> " + opId2 + "." + portName2 + " (incompatible ports?)" }], "isError": true };
+
+            outData.setRef({ "data": data });
+            return data;
+        }
+    );
+
+    server.tool(
+        "add-op",
+        "add a new op to the current patch by its full op name (objName), e.g. Ops.Anim.Timer_v2; get valid names from search-ops. returns the new op's id (use it with link-ports / set-port-value) and its port names. optional x/y place it in the patch editor view.",
+        { "objName": z.string(), "x": z.number().optional(), "y": z.number().optional() },
+        ({ objName, x, y }) =>
+        {
+            logMcp("add-op " + objName);
+
+            const uiAttribs = {};
+            if (x !== undefined || y !== undefined) uiAttribs.translate = { "x": x || 0, "y": y || 0 };
+
+            let newOp;
+            try
+            {
+                newOp = CABLES.patch.addOp(objName, uiAttribs);
+            }
+            catch (e)
+            {
+                const data = { "content": [{ "type": "text", "text": "could not add op \"" + objName + "\": " + e.message }], "isError": true };
+                outData.setRef({ "data": data });
+                return data;
+            }
+
+            if (!newOp)
+            {
+                const data = { "content": [{ "type": "text", "text": "could not add op \"" + objName + "\" (no such op? see search-ops)" }], "isError": true };
+                outData.setRef({ "data": data });
+                return data;
+            }
+
+            const portsIn = newOp.portsIn.map((p) => p.name);
+            const portsOut = newOp.portsOut.map((p) => p.name);
+
+            const data = { "content": [{ "type": "text", "text": "added " + objName + " with id " + newOp.id + "; portsIn: [" + portsIn.join(", ") + "]; portsOut: [" + portsOut.join(", ") + "]" }] };
+            outData.setRef({ "data": data });
+            return data;
+        }
+    );
+
+    server.tool(
+        "delete-op",
+        "delete an op from the current patch by its id (see cables://patch.json for op ids); this also removes any links connected to it",
+        { "opId": z.string() },
+        ({ opId }) =>
+        {
+            logMcp("delete-op " + opId);
+
+            const targetOp = CABLES.patch.getOpById(opId);
+            if (!targetOp)
+            {
+                const data = { "content": [{ "type": "text", "text": "no op found with id " + opId }], "isError": true };
+                outData.setRef({ "data": data });
+                return data;
+            }
+
+            const objName = targetOp.objName;
+
+            // CABLES.patch.deleteOp does not return a success value, so verify by checking
+            // that the op is actually gone from the patch afterwards
+            CABLES.patch.deleteOp(opId);
+            const stillThere = !!CABLES.patch.getOpById(opId);
+
+            const data = !stillThere
+                ? { "content": [{ "type": "text", "text": "deleted " + objName + " (" + opId + ")" }] }
+                : { "content": [{ "type": "text", "text": "could not delete op " + opId }], "isError": true };
+
+            outData.setRef({ "data": data });
+            return data;
+        }
+    );
+
+    server.tool(
         "screenshot",
-        "take a screenshot of the patch's rendering canvas (CABLES.patch.cgl.canvas) and return it as a png image; use it to check what a change looks like. maxWidth downscales the image (default 1024)",
+        "take a screenshot of the patch's rendering canvas and return it as a png image; use it to check what a change looks like.",
         { "maxWidth": z.number().optional() },
         async ({ maxWidth }) =>
         {
