@@ -144,6 +144,20 @@ function grabScreenshot(maxWidth)
     });
 }
 
+// saves the current patch to disk/server, the same way the editor's own save
+// (ctrl+s / save button) does. force=true skips the guest/unsaved-changes
+// warning dialogs, since there is no user around to click through them.
+function savePatch()
+{
+    return new Promise((resolve) =>
+    {
+        gui.patchView.store.saveCurrentProject(() =>
+        {
+            resolve();
+        }, true);
+    });
+}
+
 const s = new CABLES.UI.OpSearch();
 s.buildList();
 
@@ -362,7 +376,6 @@ function buildMcpServer()
             // op's onTriggered handler directly, regardless of whether anything is linked.
             port._onTriggered();
 
-            if (CABLES.UI && gui.patchView.isCurrentOp(targetOp)) targetOp.refreshParams();
 
             const data = { "content": [{ "type": "text", "text": "triggered " + opId + "." + portName }] };
             outData.setRef({ "data": data });
@@ -414,6 +427,103 @@ function buildMcpServer()
                 ? { "content": [{ "type": "text", "text": "linked " + opId1 + "." + portName1 + " -> " + opId2 + "." + portName2 }] }
                 : { "content": [{ "type": "text", "text": "could not link " + opId1 + "." + portName1 + " -> " + opId2 + "." + portName2 + " (incompatible ports?)" }], "isError": true };
 
+            outData.setRef({ "data": data });
+            return data;
+        }
+    );
+
+    server.tool(
+        "unlink-ports",
+        "remove an existing link between two ports (the inverse of link-ports); identify ops by id and ports by name. fails if no such link exists.",
+        { "opId1": z.string(), "portName1": z.string(), "opId2": z.string(), "portName2": z.string() },
+        ({ opId1, portName1, opId2, portName2 }) =>
+        {
+            logMcp("unlink-ports " + opId1 + "." + portName1 + " -> " + opId2 + "." + portName2);
+
+            const op1 = CABLES.patch.getOpById(opId1);
+            const op2 = CABLES.patch.getOpById(opId2);
+            if (!op1 || !op2)
+            {
+                const data = { "content": [{ "type": "text", "text": "no op found with id " + (!op1 ? opId1 : opId2) }], "isError": true };
+                outData.setRef({ "data": data });
+                return data;
+            }
+
+            const port1 = op1.getPort(portName1);
+            const port2 = op2.getPort(portName2);
+            if (!port1 || !port2)
+            {
+                const data = { "content": [{ "type": "text", "text": "no port named \"" + (!port1 ? portName1 : portName2) + "\" on op " + (!port1 ? opId1 : opId2) }], "isError": true };
+                outData.setRef({ "data": data });
+                return data;
+            }
+
+            const existing = port1.links.find((l) => l.getOtherPort(port1) === port2);
+            if (!existing)
+            {
+                const data = { "content": [{ "type": "text", "text": "no link found between " + opId1 + "." + portName1 + " and " + opId2 + "." + portName2 }], "isError": true };
+                outData.setRef({ "data": data });
+                return data;
+            }
+
+            existing.remove();
+
+            const data = { "content": [{ "type": "text", "text": "unlinked " + opId1 + "." + portName1 + " -> " + opId2 + "." + portName2 }] };
+            outData.setRef({ "data": data });
+            return data;
+        }
+    );
+
+    server.tool(
+        "move-op",
+        "reposition an existing op in the patch editor view (does not affect rendering, purely cosmetic layout); identify the op by its id and give its new x/y editor coordinates",
+        { "opId": z.string(), "x": z.number(), "y": z.number() },
+        ({ opId, x, y }) =>
+        {
+            logMcp("move-op " + opId + " -> " + x + "," + y);
+
+            const targetOp = CABLES.patch.getOpById(opId);
+            if (!targetOp)
+            {
+                const data = { "content": [{ "type": "text", "text": "no op found with id " + opId }], "isError": true };
+                outData.setRef({ "data": data });
+                return data;
+            }
+
+            targetOp.setUiAttribs({ "translate": { "x": x, "y": y } });
+
+            const data = { "content": [{ "type": "text", "text": "moved " + opId + " to " + x + "," + y }] };
+            outData.setRef({ "data": data });
+            return data;
+        }
+    );
+
+    server.tool(
+        "focus-op",
+        "scroll/zoom the patch editor view to center on an op and open its param panel, so the person looking at the editor can see it. does not affect rendering.",
+        { "opId": z.string() },
+        ({ opId }) =>
+        {
+            logMcp("focus-op " + opId);
+
+            const targetOp = CABLES.patch.getOpById(opId);
+            if (!targetOp)
+            {
+                const data = { "content": [{ "type": "text", "text": "no op found with id " + opId }], "isError": true };
+                outData.setRef({ "data": data });
+                return data;
+            }
+
+            if (!CABLES.UI || !gui.patchView || !gui.patchView.patchRenderer || !gui.patchView.patchRenderer.focusOp)
+            {
+                const data = { "content": [{ "type": "text", "text": "no patch editor UI available to focus on" }], "isError": true };
+                outData.setRef({ "data": data });
+                return data;
+            }
+
+            gui.patchView.patchRenderer.focusOp(opId);
+
+            const data = { "content": [{ "type": "text", "text": "focused " + opId + " (" + targetOp.objName + ") in the patch editor" }] };
             outData.setRef({ "data": data });
             return data;
         }
@@ -476,14 +586,36 @@ function buildMcpServer()
 
             const objName = targetOp.objName;
 
-            // CABLES.patch.deleteOp does not return a success value, so verify by checking
-            // that the op is actually gone from the patch afterwards
             CABLES.patch.deleteOp(opId);
             const stillThere = !!CABLES.patch.getOpById(opId);
 
             const data = !stillThere
                 ? { "content": [{ "type": "text", "text": "deleted " + objName + " (" + opId + ")" }] }
                 : { "content": [{ "type": "text", "text": "could not delete op " + opId }], "isError": true };
+
+            outData.setRef({ "data": data });
+            return data;
+        }
+    );
+
+    server.tool(
+        "save-patch",
+        "save the current patch to disk/server, the same as the editor's own save action (ctrl+s). skips confirmation dialogs since there is no user to click through them.",
+        { },
+        async () =>
+        {
+            logMcp("save-patch");
+
+            let data;
+            try
+            {
+                await savePatch();
+                data = { "content": [{ "type": "text", "text": "patch saved" }] };
+            }
+            catch (e)
+            {
+                data = { "content": [{ "type": "text", "text": "save failed: " + e.message }], "isError": true };
+            }
 
             outData.setRef({ "data": data });
             return data;
