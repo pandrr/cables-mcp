@@ -63,6 +63,97 @@ function getOpSource(opname)
     });
 }
 
+// sends a talkerAPI command and resolves with its result
+function talkerSend(cmd, data)
+{
+    return new Promise((resolve, reject) =>
+    {
+        CABLESUILOADER.talkerAPI.send(cmd, data, (err, rslt) =>
+        {
+            if (err) reject(new Error(err.msg || JSON.stringify(err)));
+            else resolve(rslt);
+        });
+    });
+}
+
+// attachment file names always start with att_, e.g. att_inc_node.js
+function attachmentFileName(name)
+{
+    return name.startsWith("att_") ? name : "att_" + name;
+}
+
+function getOpDocOrThrow(opname)
+{
+    const opDoc = gui.opDocs.getOpDocByName(opname);
+    if (!opDoc) throw new Error("no op found with name " + opname);
+    return opDoc;
+}
+
+async function readOpAttachment(opname, name)
+{
+    const opDoc = getOpDocOrThrow(opname);
+    const res = await talkerSend("opAttachmentGet", { "opname": opDoc.id, "name": attachmentFileName(name) });
+    if (!res || res.content === undefined || res.content === null) throw new Error("no attachment " + attachmentFileName(name) + " in op " + opname + ", see list-op-attachments");
+    return res.content;
+}
+
+// writes an attachment, creates it first if the op does not have it yet
+async function writeOpAttachment(opname, name, content)
+{
+    const opDoc = getOpDocOrThrow(opname);
+    const fileName = attachmentFileName(name);
+    opDoc.attachmentFiles = opDoc.attachmentFiles || [];
+
+    let created = false;
+    if (!opDoc.attachmentFiles.includes(fileName))
+    {
+        await talkerSend("opAttachmentAdd", { "opname": opDoc.id, "name": fileName.substring(4) });
+        opDoc.attachmentFiles.push(fileName);
+        created = true;
+    }
+
+    const res = await talkerSend("opAttachmentSave", { "opname": opDoc.id, "name": fileName, "content": content });
+    if (res && res.data && res.data.updated) gui.patchView.store.setServerDate(res.data.updated);
+    gui.emitEvent("refreshManageOp", opDoc.name);
+    return created;
+}
+
+// rejects when a promise does not settle in time, so tools report which step hung instead of blocking
+function withTimeout(promise, ms, step)
+{
+    return Promise.race([promise, new Promise((resolve, reject) => { setTimeout(() => { reject(new Error("timeout in step: " + step)); }, ms); })]);
+}
+
+// creates a new op (the location follows from its name), optionally with code and attachments { "att_name": content }, and loads it.
+// attachments are written afterwards, passing them to opCreate fails in electron when the project has op dirs
+async function createOp(opname, code, attachments)
+{
+    const req = { "opname": opname };
+    if (code) req.code = code;
+
+    const res = await withTimeout(talkerSend("opCreate", req), 10000, "opCreate");
+    if (res && res.problems && res.problems.length) throw new Error(res.problems.join(", "));
+
+    const created = (res && res.data) || res;
+    await withTimeout(new Promise((resolve) => { gui.serverOps.loadOp(created, () => { resolve(); }); }), 15000, "loadOp");
+
+    for (const name in attachments || {}) await withTimeout(writeOpAttachment(opname, name, attachments[name]), 10000, "attachment " + name);
+    if (attachments && Object.keys(attachments).length) await executeOp(opname);
+
+    gui.opSelect().reload();
+    return created;
+}
+
+// reloads the code of an op in all its instances in the patch
+function executeOp(opname)
+{
+    return new Promise((resolve) =>
+    {
+        const timeout = setTimeout(resolve, 15000);
+        gui.serverOps.execute(opname, () => { clearTimeout(timeout); resolve(); });
+    });
+}
+
 // the documentation of an op as a plain object, null if there is none
 function getOpDocData(objName)
 {
@@ -455,6 +546,85 @@ function buildMcpServer()
             }
 
             return respondText(tab ? "content updated" : "no opened file matches uri " + uri);
+        }
+    );
+
+    server.tool(
+        "create-op",
+        "create a new op by its full name (e.g. Ops.Extension.ShaderGraph.Sdf.Sphere, the name decides where it is stored), optionally with its code and attachments as { \"att_name\": content } (att_ prefix optional). add it to the patch with add-op afterwards.",
+        { "opname": z.string(), "code": z.string().optional(), "attachments": z.record(z.string()).optional() },
+        async ({ opname, code, attachments }) =>
+        {
+            logMcp("create op " + opname);
+
+            if (gui.opDocs.getOpDocByName(opname)) return respondError("op " + opname + " already exists, use edit-op / write-op-attachment");
+
+            try
+            {
+                await createOp(opname, code, attachments);
+                return respondText("created op " + opname);
+            }
+            catch (e)
+            {
+                return respondError("could not create op: " + e.message);
+            }
+        }
+    );
+
+    server.tool(
+        "list-op-attachments",
+        "list the attachment files of an op (e.g. att_inc_node.js, att_shader.vert), by full op name. read them with read-op-attachment, change them with write-op-attachment.",
+        { "opname": z.string() },
+        ({ opname }) =>
+        {
+            logMcp("list attachments " + opname);
+
+            const opDoc = gui.opDocs.getOpDocByName(opname);
+            if (!opDoc) return respondError("no op found with name " + opname);
+
+            const files = opDoc.attachmentFiles || [];
+            return respondText(files.length ? files.join("\n") : "op " + opname + " has no attachments");
+        }
+    );
+
+    server.tool(
+        "read-op-attachment",
+        "read the content of an op attachment file by full op name and attachment name (e.g. att_inc_node.js, the att_ prefix is optional); see list-op-attachments",
+        { "opname": z.string(), "name": z.string() },
+        async ({ opname, name }) =>
+        {
+            logMcp("read attachment " + opname + "/" + attachmentFileName(name));
+
+            try
+            {
+                return respondText(await readOpAttachment(opname, name));
+            }
+            catch (e)
+            {
+                return respondError("could not read attachment: " + e.message);
+            }
+        }
+    );
+
+    server.tool(
+        "write-op-attachment",
+        "write the full content of an op attachment file (the att_ prefix is optional), creating it if the op does not have it yet. att_inc_*.js files are included into the op code, other attachments are available in the op as attachments.<name> (dots replaced by _). by default the op is re-executed afterwards so all instances in the patch use the new code; pass execute=false when writing several attachments and only execute on the last one.",
+        { "opname": z.string(), "name": z.string(), "content": z.string(), "execute": z.boolean().optional() },
+        async ({ opname, name, content, execute }) =>
+        {
+            logMcp("write attachment " + opname + "/" + attachmentFileName(name));
+
+            try
+            {
+                const created = await writeOpAttachment(opname, name, content);
+                if (execute !== false) await executeOp(opname);
+
+                return respondText((created ? "created " : "saved ") + attachmentFileName(name) + (execute !== false ? ", op re-executed" : ""));
+            }
+            catch (e)
+            {
+                return respondError("could not write attachment: " + e.message);
+            }
         }
     );
 
