@@ -8,8 +8,6 @@ const
     outData = op.outObject("Last Request Data"),
     outLog = op.outString("Log","");
 
-let log = "";
-let logCount = 0;
 let currentServer = null;
 buildMcpServer();
 
@@ -65,7 +63,32 @@ function getOpSource(opname)
     });
 }
 
-// resolves any uri this server hands out (mcpfile:/// or cables://op/ or cables://patch.json) to { mimeType, text }
+// the documentation of an op as a plain object, null if there is none
+function getOpDocData(objName)
+{
+    const opDoc = gui.opDocs.getOpDocByName(objName);
+    if (!opDoc) return null;
+
+    return {
+        "name": opDoc.name,
+        "id": opDoc.id,
+        "summary": opDoc.summary,
+        "content": opDoc.content,
+        "description": opDoc.description,
+        "version": opDoc.version,
+        "oldVersion": opDoc.oldVersion,
+        "hidden": opDoc.hidden,
+        "authorName": opDoc.authorName,
+        "exampleProjectId": opDoc.exampleProjectId,
+        "libs": opDoc.libs,
+        "coreLibs": opDoc.coreLibs,
+        "dependencies": opDoc.dependencies,
+        "ports": opDoc.docs ? opDoc.docs.ports : undefined,
+        "layout": opDoc.layout
+    };
+}
+
+// resolves any uri this server hands out (mcpfile:///, cables://op/, cables://opdoc/ or cables://patch.json) to { mimeType, text }
 async function readResourceContent(uri)
 {
     if (uri.startsWith("mcpfile:///"))
@@ -79,18 +102,55 @@ async function readResourceContent(uri)
         const code = await getOpSource(uri.replace("cables://op/", ""));
         return { "mimeType": "application/javascript", "text": code };
     }
-    if (uri === "cables://patch.json")
+    if (uri.startsWith("cables://opdoc/"))
     {
-        return { "mimeType": "application/json", "text": JSON.stringify(op.patch.serialize()) };
+        const objName = uri.replace("cables://opdoc/", "");
+        const doc = getOpDocData(objName);
+        if (!doc) throw new Error("no op docs found for " + objName);
+        return { "mimeType": "application/json", "text": JSON.stringify(doc, null, 1) };
     }
+    if (uri === "cables://patch.json") return { "mimeType": "application/json", "text": JSON.stringify(op.patch.serialize()) };
     throw new Error("unsupported uri " + uri);
 }
 
+outLog.changeAlways = true;
+
 function logMcp(_log)
 {
-    log = log + logCount + ": " + _log + "\n";
-    logCount++;
-    outLog.set(log);
+    const time = new Date().toTimeString().substring(0, 8);
+    outLog.set(time + " " + _log);
+}
+
+// the log port starts with this line instead of "", relinking after an op reload copies the current value to the logger
+logMcp("mcp server loading");
+
+// readable name of an op for the log, e.g. "Rectangle" instead of its id
+function opLabel(opId)
+{
+    const o = CABLES.patch.getOpById(opId);
+    return o ? o.getTitle() : "unknown op " + opId;
+}
+
+// every tool/resource result goes through here, so the op's "Last Request Data" output shows it
+function respond(data)
+{
+    outData.setRef({ "data": data });
+    return data;
+}
+
+function respondText(text)
+{
+    return respond({ "content": [{ "type": "text", "text": text }] });
+}
+
+function respondError(text)
+{
+    return respond({ "content": [{ "type": "text", "text": text }], "isError": true });
+}
+
+function uriLabel(uri)
+{
+    return String(uri).replace("mcpfile:///", "").replace("cables://opdoc/", "").replace("cables://op/", "");
 }
 
 // sets a port value the same way the param panel does: undoable, synced and marked unsaved
@@ -275,11 +335,9 @@ function buildMcpServer()
         { "description": "a file currently opened in the cables code editor" },
         async (uri) =>
         {
-            logMcp("read open-tab " + uri.href);
+            logMcp("read file " + uriLabel(uri.href));
             const content = await readResourceContent(uri.href);
-            const data = { "contents": [{ "uri": uri.href, ...content }] };
-            outData.setRef({ "data": data });
-            return data;
+            return respond({ "contents": [{ "uri": uri.href, ...content }] });
         }
     );
 
@@ -289,10 +347,9 @@ function buildMcpServer()
         { "description": "read-only structure and data of the current patch" },
         async (uri) =>
         {
-             const content= op.patch.serialize() ;
-            const data = { "contents": [{ "uri": uri.href, ...content }] };
-            outData.setRef({ "data": data });
-            return data;
+            logMcp("read patch.json");
+            const content = op.patch.serialize();
+            return respond({ "contents": [{ "uri": uri.href, ...content }] });
         }
     );
 
@@ -302,11 +359,21 @@ function buildMcpServer()
         { "description": "read-only source code of a cables op; get op names from search-ops" },
         async (uri) =>
         {
-            logMcp("read op-source " + uri.href);
+            logMcp("read op source " + uriLabel(uri.href));
             const content = await readResourceContent(uri.href);
-            const data = { "contents": [{ "uri": uri.href, ...content }] };
-            outData.setRef({ "data": data });
-            return data;
+            return respond({ "contents": [{ "uri": uri.href, ...content }] });
+        }
+    );
+
+    server.registerResource(
+        "op-docs",
+        new McpServer.ResourceTemplate("cables://opdoc/{objName}", { "list": undefined }),
+        { "description": "documentation of a cables op as json (summary, description, port docs, ports layout); get op names from search-ops or list-op-docs" },
+        async (uri) =>
+        {
+            logMcp("read op docs " + uriLabel(uri.href));
+            const content = await readResourceContent(uri.href);
+            return respond({ "contents": [{ "uri": uri.href, ...content }] });
         }
     );
 
@@ -319,24 +386,20 @@ function buildMcpServer()
         { },
         () =>
         {
-            logMcp("list-resources");
-            const data = { "content": listOpenTabResources().map((r) => ({ "type": "resource_link", ...r })) };
-            outData.setRef({ "data": data });
-            return data;
+            logMcp("list open files");
+            return respond({ "content": listOpenTabResources().map((r) => ({ "type": "resource_link", ...r })) });
         }
     );
 
     server.tool(
         "read-resource",
-        "read a resource by uri (mcpfile:///<name>, cables://op/<opname>, or cables://patch.json)",
+        "read a resource by uri (mcpfile:///<name>, cables://op/<opname>, cables://opdoc/<opname>, or cables://patch.json)",
         { "uri": z.string() },
         async ({ uri }) =>
         {
-            logMcp("read-resource " + uri);
+            logMcp("read " + uriLabel(uri));
             const content = await readResourceContent(uri);
-            const data = { "content": [{ "type": "text", "text": content.text }] };
-            outData.setRef({ "data": data });
-            return data;
+            return respondText(content.text);
         }
     );
 
@@ -346,11 +409,9 @@ function buildMcpServer()
         { "opname": z.string() },
         (opts) =>
         {
+            logMcp("edit op " + opts.opname);
             gui.serverOps.edit(opts.opname, false, null, true);
-            const data = { "content": [] };
-
-            outData.setRef({ "data": data });
-            return data;
+            return respond({ "content": [] });
         }
     );
 
@@ -360,7 +421,7 @@ function buildMcpServer()
         { "str": z.string() },
         (str) =>
         {
-            logMcp("search ops: " + str.str);
+            logMcp("search ops \"" + str.str + "\"");
             s.search(str.str);
             const data = { "content": [] };
             for (let i = 0; i < s.list.length; i++)
@@ -376,8 +437,7 @@ function buildMcpServer()
                 }
             }
 
-            outData.setRef({ "data": data });
-            return data;
+            return respond(data);
         }
     );
 
@@ -387,7 +447,7 @@ function buildMcpServer()
         { "uri": z.string(), "text": z.string() },
         ({ uri, text }) =>
         {
-            logMcp("set-opened-resources " + uri);
+            logMcp("write file " + uriLabel(uri));
             const tab = findOpenTab(uri.replace("mcpfile:///", ""));
             if (tab)
             {
@@ -395,10 +455,7 @@ function buildMcpServer()
                 tab.editor.save();
             }
 
-            const data = { "content": [{ "type": "text", "text": tab ? "content updated" : "no opened file matches uri " + uri }] };
-
-            outData.setRef({ "data": data });
-            return data;
+            return respondText(tab ? "content updated" : "no opened file matches uri " + uri);
         }
     );
 
@@ -408,29 +465,17 @@ function buildMcpServer()
         { "opId": z.string(), "portName": z.string(), "value": z.any() },
         ({ opId, portName, value }) =>
         {
-            logMcp("set-port-value " + opId + "." + portName);
+            logMcp("set " + opLabel(opId) + "." + portName + " = " + String(JSON.stringify(value)).substring(0, 60));
 
             const targetOp = op.patch.getOpById(opId);
-            if (!targetOp)
-            {
-                const data = { "content": [{ "type": "text", "text": "no op found with id " + opId }] };
-                outData.setRef({ "data": data });
-                return data;
-            }
+            if (!targetOp) return respondText("no op found with id " + opId);
 
             const port = targetOp.getPort(portName);
-            if (!port)
-            {
-                const data = { "content": [{ "type": "text", "text": "no port named \"" + portName + "\" on op " + opId }] };
-                outData.setRef({ "data": data });
-                return data;
-            }
+            if (!port) return respondText("no port named \"" + portName + "\" on op " + opId);
 
             setPortValueUndoable(opId, portName, value);
 
-            const data = { "content": [{ "type": "text", "text": "set " + opId + "." + portName + " = " + JSON.stringify(value) }] };
-            outData.setRef({ "data": data });
-            return data;
+            return respondText("set " + opId + "." + portName + " = " + JSON.stringify(value));
         }
     );
 
@@ -440,30 +485,15 @@ function buildMcpServer()
         { "opId": z.string(), "portName": z.string() },
         ({ opId, portName }) =>
         {
-            logMcp("trigger-port " + opId + "." + portName);
+            logMcp("trigger " + opLabel(opId) + "." + portName);
 
             const targetOp = CABLES.patch.getOpById(opId);
-            if (!targetOp)
-            {
-                const data = { "content": [{ "type": "text", "text": "no op found with id " + opId }], "isError": true };
-                outData.setRef({ "data": data });
-                return data;
-            }
+            if (!targetOp) return respondError("no op found with id " + opId);
 
             const port = targetOp.getPort(portName);
-            if (!port)
-            {
-                const data = { "content": [{ "type": "text", "text": "no port named \"" + portName + "\" on op " + opId }], "isError": true };
-                outData.setRef({ "data": data });
-                return data;
-            }
+            if (!port) return respondError("no port named \"" + portName + "\" on op " + opId);
 
-            if (port.getType() !== CABLES.Port.TYPE_TRIGGER)
-            {
-                const data = { "content": [{ "type": "text", "text": "port \"" + portName + "\" on op " + opId + " is not a trigger port" }], "isError": true };
-                outData.setRef({ "data": data });
-                return data;
-            }
+            if (port.getType() !== CABLES.Port.TYPE_TRIGGER) return respondError("port \"" + portName + "\" on op " + opId + " is not a trigger port");
 
             // .trigger() only forwards along the port's own links, which is a no-op for a
             // port that has nothing wired to it. _onTriggered() is what the cables editor's
@@ -472,9 +502,7 @@ function buildMcpServer()
             port._onTriggered();
 
 
-            const data = { "content": [{ "type": "text", "text": "triggered " + opId + "." + portName }] };
-            outData.setRef({ "data": data });
-            return data;
+            return respondText("triggered " + opId + "." + portName);
         }
     );
 
@@ -484,46 +512,22 @@ function buildMcpServer()
         { "opId1": z.string(), "portName1": z.string(), "opId2": z.string(), "portName2": z.string() },
         ({ opId1, portName1, opId2, portName2 }) =>
         {
-            logMcp("link-ports " + opId1 + "." + portName1 + " -> " + opId2 + "." + portName2);
+            logMcp("link " + opLabel(opId1) + "." + portName1 + " -> " + opLabel(opId2) + "." + portName2);
 
             const op1 = CABLES.patch.getOpById(opId1);
-            if (!op1)
-            {
-                const data = { "content": [{ "type": "text", "text": "no op found with id " + opId1 }], "isError": true };
-                outData.setRef({ "data": data });
-                return data;
-            }
+            if (!op1) return respondError("no op found with id " + opId1);
 
             const op2 = CABLES.patch.getOpById(opId2);
-            if (!op2)
-            {
-                const data = { "content": [{ "type": "text", "text": "no op found with id " + opId2 }], "isError": true };
-                outData.setRef({ "data": data });
-                return data;
-            }
+            if (!op2) return respondError("no op found with id " + opId2);
 
-            if (!op1.getPort(portName1))
-            {
-                const data = { "content": [{ "type": "text", "text": "no port named \"" + portName1 + "\" on op " + opId1 }], "isError": true };
-                outData.setRef({ "data": data });
-                return data;
-            }
+            if (!op1.getPort(portName1)) return respondError("no port named \"" + portName1 + "\" on op " + opId1);
 
-            if (!op2.getPort(portName2))
-            {
-                const data = { "content": [{ "type": "text", "text": "no port named \"" + portName2 + "\" on op " + opId2 }], "isError": true };
-                outData.setRef({ "data": data });
-                return data;
-            }
+            if (!op2.getPort(portName2)) return respondError("no port named \"" + portName2 + "\" on op " + opId2);
 
             const link = CABLES.patch.link(op1, portName1, op2, portName2);
 
-            const data = link
-                ? { "content": [{ "type": "text", "text": "linked " + opId1 + "." + portName1 + " -> " + opId2 + "." + portName2 }] }
-                : { "content": [{ "type": "text", "text": "could not link " + opId1 + "." + portName1 + " -> " + opId2 + "." + portName2 + " (incompatible ports?)" }], "isError": true };
-
-            outData.setRef({ "data": data });
-            return data;
+            if (!link) return respondError("could not link " + opId1 + "." + portName1 + " -> " + opId2 + "." + portName2 + " (incompatible ports?)");
+            return respondText("linked " + opId1 + "." + portName1 + " -> " + opId2 + "." + portName2);
         }
     );
 
@@ -533,39 +537,22 @@ function buildMcpServer()
         { "opId1": z.string(), "portName1": z.string(), "opId2": z.string(), "portName2": z.string() },
         ({ opId1, portName1, opId2, portName2 }) =>
         {
-            logMcp("unlink-ports " + opId1 + "." + portName1 + " -> " + opId2 + "." + portName2);
+            logMcp("unlink " + opLabel(opId1) + "." + portName1 + " -> " + opLabel(opId2) + "." + portName2);
 
             const op1 = CABLES.patch.getOpById(opId1);
             const op2 = CABLES.patch.getOpById(opId2);
-            if (!op1 || !op2)
-            {
-                const data = { "content": [{ "type": "text", "text": "no op found with id " + (!op1 ? opId1 : opId2) }], "isError": true };
-                outData.setRef({ "data": data });
-                return data;
-            }
+            if (!op1 || !op2) return respondError("no op found with id " + (!op1 ? opId1 : opId2));
 
             const port1 = op1.getPort(portName1);
             const port2 = op2.getPort(portName2);
-            if (!port1 || !port2)
-            {
-                const data = { "content": [{ "type": "text", "text": "no port named \"" + (!port1 ? portName1 : portName2) + "\" on op " + (!port1 ? opId1 : opId2) }], "isError": true };
-                outData.setRef({ "data": data });
-                return data;
-            }
+            if (!port1 || !port2) return respondError("no port named \"" + (!port1 ? portName1 : portName2) + "\" on op " + (!port1 ? opId1 : opId2));
 
             const existing = port1.links.find((l) => l.getOtherPort(port1) === port2);
-            if (!existing)
-            {
-                const data = { "content": [{ "type": "text", "text": "no link found between " + opId1 + "." + portName1 + " and " + opId2 + "." + portName2 }], "isError": true };
-                outData.setRef({ "data": data });
-                return data;
-            }
+            if (!existing) return respondError("no link found between " + opId1 + "." + portName1 + " and " + opId2 + "." + portName2);
 
             existing.remove();
 
-            const data = { "content": [{ "type": "text", "text": "unlinked " + opId1 + "." + portName1 + " -> " + opId2 + "." + portName2 }] };
-            outData.setRef({ "data": data });
-            return data;
+            return respondText("unlinked " + opId1 + "." + portName1 + " -> " + opId2 + "." + portName2);
         }
     );
 
@@ -575,15 +562,10 @@ function buildMcpServer()
         { "opId": z.string(), "x": z.number(), "y": z.number() },
         ({ opId, x, y }) =>
         {
-            logMcp("move-op " + opId + " -> " + x + "," + y);
+            logMcp("move " + opLabel(opId) + " to " + x + "," + y);
 
             const targetOp = CABLES.patch.getOpById(opId);
-            if (!targetOp)
-            {
-                const data = { "content": [{ "type": "text", "text": "no op found with id " + opId }], "isError": true };
-                outData.setRef({ "data": data });
-                return data;
-            }
+            if (!targetOp) return respondError("no op found with id " + opId);
 
             const old = targetOp.uiAttribs.translate || { "x": 0, "y": 0 };
             const oldX = old.x, oldY = old.y;
@@ -596,9 +578,7 @@ function buildMcpServer()
                 "redo": () => { moveTo(x, y); }
             });
 
-            const data = { "content": [{ "type": "text", "text": "moved " + opId + " to " + x + "," + y }] };
-            outData.setRef({ "data": data });
-            return data;
+            return respondText("moved " + opId + " to " + x + "," + y);
         }
     );
 
@@ -608,28 +588,16 @@ function buildMcpServer()
         { "opId": z.string() },
         ({ opId }) =>
         {
-            logMcp("focus-op " + opId);
+            logMcp("focus " + opLabel(opId));
 
             const targetOp = CABLES.patch.getOpById(opId);
-            if (!targetOp)
-            {
-                const data = { "content": [{ "type": "text", "text": "no op found with id " + opId }], "isError": true };
-                outData.setRef({ "data": data });
-                return data;
-            }
+            if (!targetOp) return respondError("no op found with id " + opId);
 
-            if (!CABLES.UI || !gui.patchView || !gui.patchView.patchRenderer || !gui.patchView.patchRenderer.focusOp)
-            {
-                const data = { "content": [{ "type": "text", "text": "no patch editor UI available to focus on" }], "isError": true };
-                outData.setRef({ "data": data });
-                return data;
-            }
+            if (!CABLES.UI || !gui.patchView || !gui.patchView.patchRenderer || !gui.patchView.patchRenderer.focusOp) return respondError("no patch editor UI available to focus on");
 
             gui.patchView.patchRenderer.focusOp(opId);
 
-            const data = { "content": [{ "type": "text", "text": "focused " + opId + " (" + targetOp.objName + ") in the patch editor" }] };
-            outData.setRef({ "data": data });
-            return data;
+            return respondText("focused " + opId + " (" + targetOp.objName + ") in the patch editor");
         }
     );
 
@@ -639,7 +607,7 @@ function buildMcpServer()
         { "objName": z.string(), "x": z.number().optional(), "y": z.number().optional() },
         async ({ objName, x, y }) =>
         {
-            logMcp("add-op " + objName);
+            logMcp("add op " + objName);
 
             const uiAttribs = {};
             if (x !== undefined || y !== undefined) uiAttribs.translate = { "x": x || 0, "y": y || 0 };
@@ -651,24 +619,15 @@ function buildMcpServer()
             }
             catch (e)
             {
-                const data = { "content": [{ "type": "text", "text": "could not add op \"" + objName + "\": " + e.message }], "isError": true };
-                outData.setRef({ "data": data });
-                return data;
+                return respondError("could not add op \"" + objName + "\": " + e.message);
             }
 
-            if (!newOp)
-            {
-                const data = { "content": [{ "type": "text", "text": "could not add op \"" + objName + "\" (no such op? see search-ops)" }], "isError": true };
-                outData.setRef({ "data": data });
-                return data;
-            }
+            if (!newOp) return respondError("could not add op \"" + objName + "\" (no such op? see search-ops)");
 
             const portsIn = newOp.portsIn.map((p) => p.name);
             const portsOut = newOp.portsOut.map((p) => p.name);
 
-            const data = { "content": [{ "type": "text", "text": "added " + objName + " with id " + newOp.id + "; portsIn: [" + portsIn.join(", ") + "]; portsOut: [" + portsOut.join(", ") + "]" }] };
-            outData.setRef({ "data": data });
-            return data;
+            return respondText("added " + objName + " with id " + newOp.id + "; portsIn: [" + portsIn.join(", ") + "]; portsOut: [" + portsOut.join(", ") + "]");
         }
     );
 
@@ -678,27 +637,18 @@ function buildMcpServer()
         { "opId": z.string() },
         ({ opId }) =>
         {
-            logMcp("delete-op " + opId);
+            logMcp("delete " + opLabel(opId));
 
             const targetOp = CABLES.patch.getOpById(opId);
-            if (!targetOp)
-            {
-                const data = { "content": [{ "type": "text", "text": "no op found with id " + opId }], "isError": true };
-                outData.setRef({ "data": data });
-                return data;
-            }
+            if (!targetOp) return respondError("no op found with id " + opId);
 
             const objName = targetOp.objName;
 
             CABLES.patch.deleteOp(opId);
             const stillThere = !!CABLES.patch.getOpById(opId);
 
-            const data = !stillThere
-                ? { "content": [{ "type": "text", "text": "deleted " + objName + " (" + opId + ")" }] }
-                : { "content": [{ "type": "text", "text": "could not delete op " + opId }], "isError": true };
-
-            outData.setRef({ "data": data });
-            return data;
+            if (stillThere) return respondError("could not delete op " + opId);
+            return respondText("deleted " + objName + " (" + opId + ")");
         }
     );
 
@@ -708,19 +658,12 @@ function buildMcpServer()
         { "minLevel": z.number().optional(), "opId": z.string().optional() },
         ({ minLevel, opId }) =>
         {
-            logMcp("get-patch-errors" + (opId ? " " + opId : ""));
+            logMcp("check patch errors" + (opId ? " of " + opLabel(opId) : ""));
 
-            if (opId && !CABLES.patch.getOpById(opId))
-            {
-                const data = { "content": [{ "type": "text", "text": "no op found with id " + opId }], "isError": true };
-                outData.setRef({ "data": data });
-                return data;
-            }
+            if (opId && !CABLES.patch.getOpById(opId)) return respondError("no op found with id " + opId);
 
             const errors = getPatchErrors(minLevel === undefined ? 1 : minLevel, opId);
-            const data = { "content": [{ "type": "text", "text": errors.length ? JSON.stringify(errors, null, 1) : "no errors found" }] };
-            outData.setRef({ "data": data });
-            return data;
+            return respondText(errors.length ? JSON.stringify(errors, null, 1) : "no errors found");
         }
     );
 
@@ -730,21 +673,17 @@ function buildMcpServer()
         { },
         async () =>
         {
-            logMcp("save-patch");
+            logMcp("save patch");
 
-            let data;
             try
             {
                 await savePatch();
-                data = { "content": [{ "type": "text", "text": "patch saved" }] };
+                return respondText("patch saved");
             }
             catch (e)
             {
-                data = { "content": [{ "type": "text", "text": "save failed: " + e.message }], "isError": true };
+                return respondError("save failed: " + e.message);
             }
-
-            outData.setRef({ "data": data });
-            return data;
         }
     );
 
@@ -756,19 +695,15 @@ function buildMcpServer()
         {
             logMcp("screenshot");
 
-            let data;
             try
             {
                 const png = await grabScreenshot(maxWidth || 1024);
-                data = { "content": [{ "type": "image", "data": png, "mimeType": "image/png" }] };
+                return respond({ "content": [{ "type": "image", "data": png, "mimeType": "image/png" }] });
             }
             catch (e)
             {
-                data = { "content": [{ "type": "text", "text": "screenshot failed: " + e.message }], "isError": true };
+                return respondError("screenshot failed: " + e.message);
             }
-
-            outData.setRef({ "data": data });
-            return data;
         }
     );
 
@@ -778,7 +713,7 @@ function buildMcpServer()
         { "str": z.string().optional() },
         ({ str }) =>
         {
-            logMcp("list-commands" + (str ? " " + str : ""));
+            logMcp("list commands" + (str ? " \"" + str + "\"" : ""));
 
             const filter = (str || "").toLowerCase();
             const cmds = CABLES.CMD.commands
@@ -786,9 +721,7 @@ function buildMcpServer()
                 .filter((c) => !filter || ((c.cmd || "") + " " + (c.category || "") + " " + (c.infotext || "")).toLowerCase().indexOf(filter) > -1)
                 .map((c) => ({ "name": c.cmd, "category": c.category, "description": c.infotext }));
 
-            const data = { "content": [{ "type": "text", "text": cmds.length ? JSON.stringify(cmds, null, 1) : "no commands found" }] };
-            outData.setRef({ "data": data });
-            return data;
+            return respondText(cmds.length ? JSON.stringify(cmds, null, 1) : "no commands found");
         }
     );
 
@@ -798,29 +731,20 @@ function buildMcpServer()
         { "name": z.string() },
         async ({ name }) =>
         {
-            logMcp("run-command " + name);
+            logMcp("run command \"" + name + "\"");
 
             const cmd = CABLES.CMD.commands.find((c) => c && c.cmd == name);
-            if (!cmd || !cmd.func)
-            {
-                const data = { "content": [{ "type": "text", "text": cmd ? "command \"" + name + "\" has no function" : "no command named \"" + name + "\", use list-commands" }], "isError": true };
-                outData.setRef({ "data": data });
-                return data;
-            }
+            if (!cmd || !cmd.func) return respondError(cmd ? "command \"" + name + "\" has no function" : "no command named \"" + name + "\", use list-commands");
 
-            let data;
             try
             {
                 await cmd.func();
-                data = { "content": [{ "type": "text", "text": "executed command " + name }] };
+                return respondText("executed command " + name);
             }
             catch (e)
             {
-                data = { "content": [{ "type": "text", "text": "command failed: " + e.message }], "isError": true };
+                return respondError("command failed: " + e.message);
             }
-
-            outData.setRef({ "data": data });
-            return data;
         }
     );
 
@@ -830,7 +754,7 @@ function buildMcpServer()
         { "width": z.number(), "height": z.number() },
         ({ width, height }) =>
         {
-            logMcp("set-canvas-size " + width + "x" + height);
+            logMcp("set canvas size " + width + "x" + height);
 
             const w = Math.round(width);
             const h = Math.round(height);
@@ -841,15 +765,10 @@ function buildMcpServer()
                 gui.rendererWidth = w;
                 gui.rendererHeight = h;
             }
-            else
-            {
-                gui.canvasManager.subWindow.resizeTo(w, h);
-            }
+            else gui.canvasManager.subWindow.resizeTo(w, h);
             gui.setLayout();
 
-            const data = { "content": [{ "type": "text", "text": "canvas size set to " + w + "x" + h }] };
-            outData.setRef({ "data": data });
-            return data;
+            return respondText("canvas size set to " + w + "x" + h);
         }
     );
 
@@ -859,37 +778,12 @@ function buildMcpServer()
         { "objName": z.string() },
         ({ objName }) =>
         {
-            logMcp("get-op-docs " + objName);
+            logMcp("op docs " + objName);
 
-            const opDoc = gui.opDocs.getOpDocByName(objName);
-            if (!opDoc)
-            {
-                const data = { "content": [{ "type": "text", "text": "no op docs found for \"" + objName + "\", use search-ops to find op names" }], "isError": true };
-                outData.setRef({ "data": data });
-                return data;
-            }
+            const doc = getOpDocData(objName);
+            if (!doc) return respondError("no op docs found for \"" + objName + "\", use search-ops to find op names");
 
-            const doc = {
-                "name": opDoc.name,
-                "id": opDoc.id,
-                "summary": opDoc.summary,
-                "content": opDoc.content,
-                "description": opDoc.description,
-                "version": opDoc.version,
-                "oldVersion": opDoc.oldVersion,
-                "hidden": opDoc.hidden,
-                "authorName": opDoc.authorName,
-                "exampleProjectId": opDoc.exampleProjectId,
-                "libs": opDoc.libs,
-                "coreLibs": opDoc.coreLibs,
-                "dependencies": opDoc.dependencies,
-                "ports": opDoc.docs ? opDoc.docs.ports : undefined,
-                "layout": opDoc.layout
-            };
-
-            const data = { "content": [{ "type": "text", "text": JSON.stringify(doc, null, 1) }] };
-            outData.setRef({ "data": data });
-            return data;
+            return respondText(JSON.stringify(doc, null, 1));
         }
     );
 
@@ -899,7 +793,7 @@ function buildMcpServer()
         { "str": z.string().optional(), "includeOld": z.boolean().optional(), "includeHidden": z.boolean().optional() },
         ({ str, includeOld, includeHidden }) =>
         {
-            logMcp("list-op-docs" + (str ? " " + str : ""));
+            logMcp("list op docs" + (str ? " \"" + str + "\"" : ""));
 
             const filter = (str || "").toLowerCase();
             const lines = gui.opDocs.getAll()
@@ -909,9 +803,7 @@ function buildMcpServer()
                 .filter((d) => !filter || (d.name + " " + (d.summary || "")).toLowerCase().indexOf(filter) > -1)
                 .map((d) => d.name + ": " + (d.summary || ""));
 
-            const data = { "content": [{ "type": "text", "text": lines.length ? lines.length + " ops\n" + lines.join("\n") : "no ops found" }] };
-            outData.setRef({ "data": data });
-            return data;
+            return respondText(lines.length ? lines.length + " ops\n" + lines.join("\n") : "no ops found");
         }
     );
 
@@ -941,8 +833,12 @@ const httpServer = http.createServer(async (req, res) =>
 
 setTimeout(() =>
 {
+    window.cablesMcpServerStarts = (window.cablesMcpServerStarts || 0) + 1;
+
+    httpServer.on("error", (e) => { logMcp("mcp server error: " + e.message); });
     httpServer.listen(3000, () =>
     {
+        logMcp("mcp server " + (window.cablesMcpServerStarts > 1 ? "restarted" : "started") + " on port 3000");
         console.log("MCP server listening on http://localhost:3000/mcp");
         outStarted.set(true);
     });
