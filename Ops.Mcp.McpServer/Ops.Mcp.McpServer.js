@@ -807,6 +807,24 @@ function buildMcpServer()
         }
     );
 
+    server.tool(
+        "get-patch-op",
+        "get one op instance from the current patch as serialized json, by its op id (see cables://patch.json for op ids): its current port values, uiAttribs, storage and outgoing links (incoming links are stored on the op they come from). this is the op as it is used in the patch, not its documentation (use get-op-docs for that) and not its source code (use cables://op/<name>).",
+        { "opId": z.string() },
+        ({ opId }) =>
+        {
+            logMcp("get patch op " + opLabel(opId));
+
+            const targetOp = CABLES.patch.getOpById(opId);
+            if (!targetOp) return respondError("no op found with id " + opId);
+
+            const serialized = targetOp.getSerialized();
+            if (!serialized.objName) serialized.objName = targetOp.objName;
+
+            return respondText(JSON.stringify(serialized, null, 1));
+        }
+    );
+
     return server;
 }
 
