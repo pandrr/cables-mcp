@@ -853,6 +853,68 @@ function buildMcpServer()
         }
     );
 
+    server.tool(
+        "get-op-docs",
+        "get the documentation of an op by its full op name (objName), e.g. Ops.Gl.Meshes.Circle_v2: summary, description, port documentation, ports layout, libs/dependencies and whether a newer version exists (oldVersion)",
+        { "objName": z.string() },
+        ({ objName }) =>
+        {
+            logMcp("get-op-docs " + objName);
+
+            const opDoc = gui.opDocs.getOpDocByName(objName);
+            if (!opDoc)
+            {
+                const data = { "content": [{ "type": "text", "text": "no op docs found for \"" + objName + "\", use search-ops to find op names" }], "isError": true };
+                outData.setRef({ "data": data });
+                return data;
+            }
+
+            const doc = {
+                "name": opDoc.name,
+                "id": opDoc.id,
+                "summary": opDoc.summary,
+                "content": opDoc.content,
+                "description": opDoc.description,
+                "version": opDoc.version,
+                "oldVersion": opDoc.oldVersion,
+                "hidden": opDoc.hidden,
+                "authorName": opDoc.authorName,
+                "exampleProjectId": opDoc.exampleProjectId,
+                "libs": opDoc.libs,
+                "coreLibs": opDoc.coreLibs,
+                "dependencies": opDoc.dependencies,
+                "ports": opDoc.docs ? opDoc.docs.ports : undefined,
+                "layout": opDoc.layout
+            };
+
+            const data = { "content": [{ "type": "text", "text": JSON.stringify(doc, null, 1) }] };
+            outData.setRef({ "data": data });
+            return data;
+        }
+    );
+
+    server.tool(
+        "list-op-docs",
+        "list all documented ops, one per line as \"name: summary\". optional str filters by name/summary. old versions and hidden ops are left out unless includeOld / includeHidden is true. use get-op-docs for the full documentation of an op.",
+        { "str": z.string().optional(), "includeOld": z.boolean().optional(), "includeHidden": z.boolean().optional() },
+        ({ str, includeOld, includeHidden }) =>
+        {
+            logMcp("list-op-docs" + (str ? " " + str : ""));
+
+            const filter = (str || "").toLowerCase();
+            const lines = gui.opDocs.getAll()
+                .filter((d) => d && d.name)
+                .filter((d) => includeOld || !d.oldVersion)
+                .filter((d) => includeHidden || !d.hidden)
+                .filter((d) => !filter || (d.name + " " + (d.summary || "")).toLowerCase().indexOf(filter) > -1)
+                .map((d) => d.name + ": " + (d.summary || ""));
+
+            const data = { "content": [{ "type": "text", "text": lines.length ? lines.length + " ops\n" + lines.join("\n") : "no ops found" }] };
+            outData.setRef({ "data": data });
+            return data;
+        }
+    );
+
     return server;
 }
 
