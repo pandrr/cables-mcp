@@ -14,8 +14,6 @@ let currentServer = null;
 buildMcpServer();
 
 
-console.log("hello");
-
 function urlName(name)
 {
     return name.replace(/ /g, "_");
@@ -158,6 +156,53 @@ function savePatch()
     });
 }
 
+// collects ui errors (op.uiAttribs.uierrors, set via setUiError in core_extend_op.js) of all ops,
+// plus editor diagnostics of ports (e.g. shader compile errors with line numbers).
+// level: 0 hint, 1 warning, 2 error
+function getPatchErrors(minLevel, opId)
+{
+    const result = [];
+    const ops = CABLES.patch.ops;
+
+    for (let i = 0; i < ops.length; i++)
+    {
+        const o = ops[i];
+        if (opId && o.id != opId) continue;
+
+        const errors = [];
+        const uiErrors = o.uiAttribs.uierrors || [];
+        for (let j = 0; j < uiErrors.length; j++)
+            if (uiErrors[j].level >= minLevel)
+                errors.push({ "id": uiErrors[j].id, "level": uiErrors[j].level, "txt": uiErrors[j].txt });
+
+        // diagnostics can be stale after an error was fixed, only trust them while the op still has an error
+        const diagnostics = [];
+        const ports = uiErrors.length ? o.portsIn.concat(o.portsOut) : [];
+        for (let j = 0; j < ports.length; j++)
+        {
+            const diags = ports[j].uiAttribs.editorDiagnostics;
+            if (!diags || !diags.length) continue;
+
+            // diagnostics line numbers refer to the port's value (e.g. the final generated shader code)
+            const codeLines = typeof ports[j].get() == "string" ? ports[j].get().split("\n") : [];
+            for (let k = 0; k < diags.length; k++)
+            {
+                const d = { "port": ports[j].name, "line": diags[k].line, "message": diags[k].message };
+                if (diags[k].line > 0 && codeLines[diags[k].line - 1] !== undefined) d.code = codeLines[diags[k].line - 1].trim();
+                diagnostics.push(d);
+            }
+        }
+
+        if (!errors.length && !diagnostics.length) continue;
+
+        const entry = { "opId": o.id, "objName": o.objName, "title": o.getTitle(), "errors": errors };
+        if (o.uiAttribs.subPatch && o.uiAttribs.subPatch != "0") entry.subPatch = o.uiAttribs.subPatch;
+        if (diagnostics.length) entry.diagnostics = diagnostics;
+        result.push(entry);
+    }
+    return result;
+}
+
 const s = new CABLES.UI.OpSearch();
 s.buildList();
 
@@ -168,8 +213,6 @@ function buildMcpServer()
 {
     const server = new McpServer.McpServer({ "name": "cables standalone mcp server", "version": "1.0.0" });
     currentServer = server;
-
-    console.log("server", server);
 
     // real MCP resources, for clients that browse/read via resources/list + resources/read
     server.registerResource(
@@ -593,6 +636,28 @@ function buildMcpServer()
                 ? { "content": [{ "type": "text", "text": "deleted " + objName + " (" + opId + ")" }] }
                 : { "content": [{ "type": "text", "text": "could not delete op " + opId }], "isError": true };
 
+            outData.setRef({ "data": data });
+            return data;
+        }
+    );
+
+    server.tool(
+        "get-patch-errors",
+        "check the current patch for errors: lists ops that show ui errors/warnings (e.g. shader compile errors, missing links, wrong input types) with their messages, plus code diagnostics (line, message, code) where available. minLevel filters by severity: 0 hint, 1 warning, 2 error (default 1). optional opId checks a single op. use it after changing shader code or port values.",
+        { "minLevel": z.number().optional(), "opId": z.string().optional() },
+        ({ minLevel, opId }) =>
+        {
+            logMcp("get-patch-errors" + (opId ? " " + opId : ""));
+
+            if (opId && !CABLES.patch.getOpById(opId))
+            {
+                const data = { "content": [{ "type": "text", "text": "no op found with id " + opId }], "isError": true };
+                outData.setRef({ "data": data });
+                return data;
+            }
+
+            const errors = getPatchErrors(minLevel === undefined ? 1 : minLevel, opId);
+            const data = { "content": [{ "type": "text", "text": errors.length ? JSON.stringify(errors, null, 1) : "no errors found" }] };
             outData.setRef({ "data": data });
             return data;
         }
