@@ -824,6 +824,47 @@ function buildMcpServer()
         }
     );
 
+    server.tool(
+        "get-jobs",
+        "list what the editor is loading: \"ui\" are editor jobs (the ui loading indicator, e.g. loading op code or docs), \"patch\" are asset loading tasks started by ops in the patch (e.g. textures, files, libs). running entries show how long they have been running, one running for a long time is probably stuck. optional numFinished also lists the most recent finished entries of both with their duration.",
+        { "numFinished": z.number().optional() },
+        ({ numFinished }) =>
+        {
+            logMcp("get jobs");
+
+            const now = Date.now();
+            const last = (arr) => (numFinished ? arr.slice(-numFinished) : []);
+
+            const uiJobs = gui.jobs().getList();
+            const ui = {
+                "running": uiJobs.filter((j) => !j.finished).map((j) => ({ "id": j.id, "title": j.title, "runningMs": now - j.timeStart })),
+                "finished": last(uiJobs.filter((j) => j.finished)).map((j) => ({ "id": j.id, "title": j.title, "durationMs": j.timeEnd - j.timeStart }))
+            };
+
+            const patchTask = (t) =>
+            {
+                const r = { "type": t.type, "name": t.name };
+                if (t.op) r.op = { "id": t.op.id, "title": t.op.getTitle() };
+                if (t.finished) r.durationMs = t.timeEnd - t.timeStart;
+                else r.runningMs = now - t.timeStart;
+                return r;
+            };
+            const patchTasks = gui.corePatch().loading.getList();
+            const patch = {
+                "running": patchTasks.filter((t) => !t.finished).map(patchTask),
+                "finished": last(patchTasks.filter((t) => t.finished)).map(patchTask)
+            };
+
+            if (!numFinished)
+            {
+                delete ui.finished;
+                delete patch.finished;
+            }
+
+            return respondText(JSON.stringify({ "ui": ui, "patch": patch }, null, 1));
+        }
+    );
+
     return server;
 }
 
