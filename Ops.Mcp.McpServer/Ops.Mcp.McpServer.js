@@ -117,8 +117,7 @@ outLog.changeAlways = true;
 
 function logMcp(_log)
 {
-    const time = new Date().toTimeString().substring(0, 8);
-    outLog.set(time + " " + _log);
+    outLog.set(_log);
 }
 
 // the log port starts with this line instead of "", relinking after an op reload copies the current value to the logger
