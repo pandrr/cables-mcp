@@ -93,6 +93,60 @@ function logMcp(_log)
     outLog.set(log);
 }
 
+// sets a port value the same way the param panel does: undoable, synced and marked unsaved
+function setPortValueUndoable(opId, portName, value)
+{
+    const apply = (v) =>
+    {
+        const o = CABLES.patch.getOpById(opId);
+        if (!o) return;
+        const p = o.getPort(portName);
+        if (!p) return;
+        p.set(v);
+        gui.emitEvent("portValueEdited", o, p, v);
+        gui.savedState.setUnSaved("mcpSetPortValue", o.getSubPatch());
+        if (gui.patchView.isCurrentOp(o)) o.refreshParams();
+    };
+
+    const oldValue = CABLES.patch.getOpById(opId).getPort(portName).get();
+    apply(value);
+
+    if (oldValue !== value)
+        CABLES.UI.undo.add({
+            "title": "Value change " + portName,
+            "context": { "portname": portName },
+            "undo": () => { apply(oldValue); },
+            "redo": () => { apply(value); }
+        });
+}
+
+// adds an op via the patch view (loads op dependencies, current subpatch) and registers undo/redo
+function addOpUndoable(objName, uiAttribs)
+{
+    return new Promise((resolve, reject) =>
+    {
+        const timeout = setTimeout(() => { reject(new Error("timed out, no such op?")); }, 10000);
+
+        gui.patchView.addOp(objName, {
+            "uiAttribs": uiAttribs,
+            "onOpAdd": (newOp) =>
+            {
+                clearTimeout(timeout);
+                const opId = newOp.id;
+                const attribs = JSON.parse(JSON.stringify(newOp.uiAttribs));
+
+                CABLES.UI.undo.add({
+                    "title": "Add op " + objName,
+                    "undo": () => { CABLES.patch.deleteOp(opId); },
+                    "redo": () => { CABLES.patch.addOp(objName, attribs, opId); }
+                });
+
+                resolve(newOp);
+            }
+        });
+    });
+}
+
 // returns the current content of the rendering canvas as base64 png (without data: prefix),
 // optionally downscaled to maxWidth to keep the image small
 function captureCanvas(maxWidth)
@@ -372,9 +426,7 @@ function buildMcpServer()
                 return data;
             }
 
-            port.set(value);
-
-            if(CABLES.UI&&gui.patchView.isCurrentOp(targetOp)) targetOp.refreshParams();
+            setPortValueUndoable(opId, portName, value);
 
             const data = { "content": [{ "type": "text", "text": "set " + opId + "." + portName + " = " + JSON.stringify(value) }] };
             outData.setRef({ "data": data });
@@ -533,7 +585,16 @@ function buildMcpServer()
                 return data;
             }
 
-            targetOp.setUiAttribs({ "translate": { "x": x, "y": y } });
+            const old = targetOp.uiAttribs.translate || { "x": 0, "y": 0 };
+            const oldX = old.x, oldY = old.y;
+            const moveTo = (px, py) => { gui.patchView.patchRenderer.patchAPI.setOpUiAttribs(opId, "translate", { "x": px, "y": py }); };
+
+            moveTo(x, y);
+            CABLES.UI.undo.add({
+                "title": "Move op",
+                "undo": () => { moveTo(oldX, oldY); },
+                "redo": () => { moveTo(x, y); }
+            });
 
             const data = { "content": [{ "type": "text", "text": "moved " + opId + " to " + x + "," + y }] };
             outData.setRef({ "data": data });
@@ -576,7 +637,7 @@ function buildMcpServer()
         "add-op",
         "add a new op to the current patch by its full op name (objName), e.g. Ops.Anim.Timer_v2; get valid names from search-ops. returns the new op's id (use it with link-ports / set-port-value) and its port names. optional x/y place it in the patch editor view.",
         { "objName": z.string(), "x": z.number().optional(), "y": z.number().optional() },
-        ({ objName, x, y }) =>
+        async ({ objName, x, y }) =>
         {
             logMcp("add-op " + objName);
 
@@ -586,7 +647,7 @@ function buildMcpServer()
             let newOp;
             try
             {
-                newOp = CABLES.patch.addOp(objName, uiAttribs);
+                newOp = await addOpUndoable(objName, uiAttribs);
             }
             catch (e)
             {
@@ -706,6 +767,87 @@ function buildMcpServer()
                 data = { "content": [{ "type": "text", "text": "screenshot failed: " + e.message }], "isError": true };
             }
 
+            outData.setRef({ "data": data });
+            return data;
+        }
+    );
+
+    server.tool(
+        "list-commands",
+        "list the cables editor commands (the same as in the command palette), with category and description. optional str filters by name/category/description. run them with run-command.",
+        { "str": z.string().optional() },
+        ({ str }) =>
+        {
+            logMcp("list-commands" + (str ? " " + str : ""));
+
+            const filter = (str || "").toLowerCase();
+            const cmds = CABLES.CMD.commands
+                .filter((c) => c && c.func)
+                .filter((c) => !filter || ((c.cmd || "") + " " + (c.category || "") + " " + (c.infotext || "")).toLowerCase().indexOf(filter) > -1)
+                .map((c) => ({ "name": c.cmd, "category": c.category, "description": c.infotext }));
+
+            const data = { "content": [{ "type": "text", "text": cmds.length ? JSON.stringify(cmds, null, 1) : "no commands found" }] };
+            outData.setRef({ "data": data });
+            return data;
+        }
+    );
+
+    server.tool(
+        "run-command",
+        "run a cables editor command by its name, exactly as listed by list-commands (the same as selecting it in the command palette). many commands act on the currently selected ops.",
+        { "name": z.string() },
+        async ({ name }) =>
+        {
+            logMcp("run-command " + name);
+
+            const cmd = CABLES.CMD.commands.find((c) => c && c.cmd == name);
+            if (!cmd || !cmd.func)
+            {
+                const data = { "content": [{ "type": "text", "text": cmd ? "command \"" + name + "\" has no function" : "no command named \"" + name + "\", use list-commands" }], "isError": true };
+                outData.setRef({ "data": data });
+                return data;
+            }
+
+            let data;
+            try
+            {
+                await cmd.func();
+                data = { "content": [{ "type": "text", "text": "executed command " + name }] };
+            }
+            catch (e)
+            {
+                data = { "content": [{ "type": "text", "text": "command failed: " + e.message }], "isError": true };
+            }
+
+            outData.setRef({ "data": data });
+            return data;
+        }
+    );
+
+    server.tool(
+        "set-canvas-size",
+        "set the size of the rendering canvas in pixels, the same as the editor's \"change canvas size\" command",
+        { "width": z.number(), "height": z.number() },
+        ({ width, height }) =>
+        {
+            logMcp("set-canvas-size " + width + "x" + height);
+
+            const w = Math.round(width);
+            const h = Math.round(height);
+
+            gui.canvasManager.setSize(w, h);
+            if (gui.canvasManager.mode != gui.canvasManager.CANVASMODE_POPOUT)
+            {
+                gui.rendererWidth = w;
+                gui.rendererHeight = h;
+            }
+            else
+            {
+                gui.canvasManager.subWindow.resizeTo(w, h);
+            }
+            gui.setLayout();
+
+            const data = { "content": [{ "type": "text", "text": "canvas size set to " + w + "x" + h }] };
             outData.setRef({ "data": data });
             return data;
         }
