@@ -297,52 +297,65 @@ function addOpUndoable(objName, uiAttribs)
     });
 }
 
-// returns the current content of the rendering canvas as base64 png (without data: prefix),
-// optionally downscaled to maxWidth to keep the image small
-function captureCanvas(maxWidth)
+// converts a png blob to base64 (without data: prefix), optionally downscaled to maxWidth to keep the image small
+async function blobToPng(blob, maxWidth)
 {
-    const canvas = CABLES.patch.cgl.canvas;
-    if (!canvas) throw new Error("no rendering canvas found at CABLES.patch.cgl.canvas");
+    const img = await createImageBitmap(blob);
+    const w = maxWidth && img.width > maxWidth ? Math.round(maxWidth) : img.width;
 
-    let source = canvas;
-    if (maxWidth && canvas.width > maxWidth)
-    {
-        source = document.createElement("canvas");
-        source.width = Math.round(maxWidth);
-        source.height = Math.max(1, Math.round(canvas.height * maxWidth / canvas.width));
-        source.getContext("2d").drawImage(canvas, 0, 0, source.width, source.height);
-    }
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = Math.max(1, Math.round(img.height * w / img.width));
+    canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+    img.close();
 
-    return source.toDataURL("image/png").split(",")[1];
+    return canvas.toDataURL("image/png").split(",")[1];
 }
 
-// waits for the end of the next rendered frame so the canvas holds a complete image;
-// falls back to capturing right away if no frame arrives (e.g. patch is paused)
+// renders a frame and captures it right away with the renderer's own screenshot function (the same as the
+// "save screenshot" command), so the canvas still holds the rendered image instead of an already cleared buffer
 function grabScreenshot(maxWidth)
 {
     return new Promise((resolve, reject) =>
     {
+        const cg = gui.canvasManager.currentContextCg() || CABLES.patch.cgl;
+        if (!cg || !cg.screenShot) { reject(new Error("no rendering context with a screenshot function found")); return; }
+
+        cg.patch.renderOneFrame();
+        cg.screenShot((blob) =>
+        {
+            if (!blob) { reject(new Error("screenshot returned no image")); return; }
+            blobToPng(blob, maxWidth).then(resolve, reject);
+        }, false, "image/png");
+    });
+}
+
+// resolves after the next frame has been rendered completely, e.g. so a shader recompile
+// triggered by an op reload has happened; falls back after a timeout if no frame is rendered (e.g. patch is paused)
+function waitForRenderedFrame()
+{
+    return new Promise((resolve) =>
+    {
         const cgl = CABLES.patch.cgl;
         let done = false;
         let listener = null;
-        let timeout = null;
 
         const finish = () =>
         {
             if (done) return;
             done = true;
             clearTimeout(timeout);
-
-            // capture synchronously, still inside the frame; removing the listener while
-            // emitEvent is iterating could skip other listeners, so do that afterwards
-            try { resolve(captureCanvas(maxWidth)); }
-            catch (e) { reject(e); }
-
             if (listener) setTimeout(() => { cgl.off(listener); }, 0);
+            resolve();
         };
 
-        listener = cgl.on("endframe", finish);
-        timeout = setTimeout(finish, 1000);
+        const timeout = setTimeout(finish, 1000);
+
+        // next frame once callbacks run at the start of a frame, before rendering, so wait for the end of that frame
+        cgl.addNextFrameOnceCallback(() =>
+        {
+            if (!done) listener = cgl.on("endFrame", finish);
+        });
     });
 }
 
@@ -825,11 +838,14 @@ function buildMcpServer()
         "get-patch-errors",
         "check the current patch for errors: lists ops that show ui errors/warnings (e.g. shader compile errors, missing links, wrong input types) with their messages, plus code diagnostics (line, message, code) where available. minLevel filters by severity: 0 hint, 1 warning, 2 error (default 1). optional opId checks a single op. use it after changing shader code or port values.",
         { "minLevel": z.number().optional(), "opId": z.string().optional() },
-        ({ minLevel, opId }) =>
+        async ({ minLevel, opId }) =>
         {
             logMcp("check patch errors" + (opId ? " of " + opLabel(opId) : ""));
 
             if (opId && !CABLES.patch.getOpById(opId)) return respondError("no op found with id " + opId);
+
+            // shaders recompile while rendering, so errors of the last change only show up after the next rendered frame
+            await waitForRenderedFrame();
 
             const errors = getPatchErrors(minLevel === undefined ? 1 : minLevel, opId);
             return respondText(errors.length ? JSON.stringify(errors, null, 1) : "no errors found");
