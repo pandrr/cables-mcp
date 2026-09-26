@@ -8,6 +8,10 @@ const
     outData = op.outObject("Last Request Data"),
     outLog = op.outString("Log","");
 
+const MCP_PORT = 3000;
+const LISTEN_RETRY_MS = 100;
+const LISTEN_MAX_RETRIES = 50;
+
 let currentServer = null;
 buildMcpServer();
 
@@ -1075,24 +1079,52 @@ const httpServer = http.createServer(async (req, res) =>
     await transport.handleRequest(req, res);
 });
 
-setTimeout(() =>
+// close() only stops accepting new connections and calls back once all open ones are gone,
+// keep-alive connections of the mcp client would keep the port busy, so they are closed right away
+function stopServer(server)
 {
-    window.cablesMcpServerStarts = (window.cablesMcpServerStarts || 0) + 1;
-
-    httpServer.on("error", (e) => { logMcp("mcp server error: " + e.message); });
-    httpServer.listen(3000, () =>
+    return new Promise((resolve) =>
     {
-        logMcp("mcp server " + (window.cablesMcpServerStarts > 1 ? "restarted" : "started") + " on port 3000");
-        console.log("MCP server listening on http://localhost:3000/mcp");
+        if (!server || !server.listening) { resolve(); return; }
+
+        server.close(() => { resolve(); });
+        if (server.closeAllConnections) server.closeAllConnections();
+    });
+}
+
+// the port can still be in use for a moment after the previous server was stopped, so retry instead of giving up
+function listen(retriesLeft)
+{
+    const onListenError = (e) =>
+    {
+        if (e.code === "EADDRINUSE" && retriesLeft > 0)
+        {
+            setTimeout(() => { listen(retriesLeft - 1); }, LISTEN_RETRY_MS);
+            return;
+        }
+        logMcp("mcp server error: " + e.message);
+    };
+
+    httpServer.once("error", onListenError);
+    httpServer.listen(MCP_PORT, () =>
+    {
+        httpServer.off("error", onListenError);
+        httpServer.on("error", (e) => { logMcp("mcp server error: " + e.message); });
+
+        window.cablesMcpHttpServer = httpServer;
+        window.cablesMcpServerStarts = (window.cablesMcpServerStarts || 0) + 1;
+
+        logMcp("mcp server " + (window.cablesMcpServerStarts > 1 ? "restarted" : "started") + " on port " + MCP_PORT);
+        console.log("MCP server listening on http://localhost:" + MCP_PORT + "/mcp");
         outStarted.set(true);
     });
+}
 
-}, 500);
+// after an op reload the server of the previous instance may still be running, it has to release the port first
+stopServer(window.cablesMcpHttpServer).then(() => { listen(LISTEN_MAX_RETRIES); });
 
 op.onDelete = () =>
 {
-    httpServer.close(() =>
-    {
-        console.log("Server closed");
-    });
+    if (window.cablesMcpHttpServer === httpServer) window.cablesMcpHttpServer = null;
+    stopServer(httpServer).then(() => { console.log("Server closed"); });
 };
