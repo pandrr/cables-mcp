@@ -9,8 +9,8 @@ const
     outLog = op.outString("Log","");
 
 const MCP_PORT = 3000;
-const LISTEN_RETRY_MS = 100;
-const LISTEN_MAX_RETRIES = 50;
+const LISTEN_RETRY_MS = 20;
+const LISTEN_MAX_RETRIES = 1150;
 
 const DEVTOOLS_PORT = 9222;
 const CONSOLE_MAX_ENTRIES = 1000;
@@ -87,6 +87,22 @@ function talkerSend(cmd, data)
             if (err) reject(new Error(err.msg || JSON.stringify(err)));
             else resolve(rslt);
         });
+    });
+}
+
+// downloads a url in the editor and resolves with its content as a data url
+async function urlToDataUrl(url)
+{
+    const response = await fetch(url);
+    if (!response.ok) throw new Error("download failed: " + response.status + " " + response.statusText);
+
+    const blob = await response.blob();
+    return new Promise((resolve, reject) =>
+    {
+        const reader = new FileReader();
+        reader.onload = () => { resolve(reader.result); };
+        reader.onerror = () => { reject(reader.error); };
+        reader.readAsDataURL(blob);
     });
 }
 
@@ -775,6 +791,33 @@ function buildMcpServer()
             catch (e)
             {
                 return respondError("could not write attachment: " + e.message);
+            }
+        }
+    );
+
+    server.tool(
+        "upload-file",
+        "upload a file into the patch's asset folder, either downloaded by the editor from a url (the server must allow cors) or from base64 content. returns the path to use in file ports, e.g. the File port of Ops.Gl.Texture_v3.",
+        { "filename": z.string(), "url": z.string().optional(), "base64": z.string().optional() },
+        async ({ filename, url, base64 }) =>
+        {
+            logMcp("upload file " + filename);
+
+            if (!url && !base64) return respondError("pass either url or base64");
+
+            try
+            {
+                let fileStr = "data:application/octet-stream;base64," + base64;
+                if (url) fileStr = await urlToDataUrl(url);
+
+                const result = await talkerSend("fileUploadStr", { "fileStr": fileStr, "filename": filename });
+                const savedName = (result && result.filename) || filename;
+
+                return respondText("uploaded " + savedName + ", use it in file ports as ./" + savedName);
+            }
+            catch (e)
+            {
+                return respondError("could not upload file: " + e.message);
             }
         }
     );
