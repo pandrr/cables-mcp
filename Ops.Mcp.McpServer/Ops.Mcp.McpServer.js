@@ -9,6 +9,9 @@ const
     outLog = op.outString("Log","");
 
 const MCP_PORT = 3000;
+const SCREENSHOT_DEFAULT_MAX_SIZE = 640;
+const SELF_EXECUTE_DELAY_MS = 100;
+const SEARCH_DEFAULT_LIMIT = 20;
 const LISTEN_RETRY_MS = 20;
 const LISTEN_MAX_RETRIES = 1150;
 
@@ -174,6 +177,47 @@ async function createOp(opname, code, attachments)
     return created;
 }
 
+// saves new op code like the op code editor does, also updates the op's editor tab if it is open
+// so saving that tab later does not bring back the old code
+async function saveOpCode(opname, code)
+{
+    const opDoc = getOpDocOrThrow(opname);
+    const res = await talkerSend("saveOpCode", { "opname": opDoc.id, "code": code, "format": false });
+    if (!res.success) throw new Error(res.error ? JSON.stringify(res.error) : "saving failed");
+    if (res.updated) gui.patchView.store.setServerDate(res.updated);
+
+    const tab = findOpenTab(urlName(opname));
+    if (tab) tab.editor.setContent(code);
+}
+
+// the op code, or the content of one of its attachments when attachment is given
+function readOpText(opname, attachment)
+{
+    return attachment ? readOpAttachment(opname, attachment) : getOpSource(opname);
+}
+
+// executes the op afterwards; the response of an edit to this op itself has to be sent before
+// it restarts the mcp server, so that execution is delayed
+async function writeOpText(opname, attachment, text)
+{
+    if (attachment) await writeOpAttachment(opname, attachment, text);
+    else await saveOpCode(opname, text);
+
+    if (opname === op.objName) setTimeout(() => { executeOp(opname); }, SELF_EXECUTE_DELAY_MS);
+    else await executeOp(opname);
+}
+
+function countOccurrences(text, part)
+{
+    return text.split(part).length - 1;
+}
+
+// lines with their line numbers, like cat -n
+function numberedLines(lines, firstLine)
+{
+    return lines.map((line, i) => (firstLine + i) + "\t" + line).join("\n");
+}
+
 // reloads the code of an op in all its instances in the patch
 function executeOp(opname)
 {
@@ -300,6 +344,30 @@ function setPortValueUndoable(opId, portName, value)
         });
 }
 
+// sets an op comment the same way the param panel's comment field does: an empty comment removes it, undoable and marked unsaved
+function setOpCommentUndoable(opId, comment)
+{
+    const apply = (c) =>
+    {
+        const o = CABLES.patch.getOpById(opId);
+        if (!o) return;
+        o.uiAttr({ "comment": c || null });
+        o.patch.emitEvent("commentChanged");
+        gui.savedState.setUnSaved("mcpSetOpComment", o.getSubPatch());
+        if (gui.patchView.isCurrentOp(o)) o.refreshParams();
+    };
+
+    const oldComment = CABLES.patch.getOpById(opId).uiAttribs.comment || "";
+    apply(comment);
+
+    if (oldComment !== comment)
+        CABLES.UI.undo.add({
+            "title": "Op comment",
+            "undo": () => { apply(oldComment); },
+            "redo": () => { apply(comment); }
+        });
+}
+
 // adds an op via the patch view (loads op dependencies, current subpatch) and registers undo/redo
 function addOpUndoable(objName, uiAttribs)
 {
@@ -327,15 +395,17 @@ function addOpUndoable(objName, uiAttribs)
     });
 }
 
-// converts a png blob to base64 (without data: prefix), optionally downscaled to maxWidth to keep the image small
-async function blobToPng(blob, maxWidth)
+// converts a png blob to base64 (without data: prefix), downscaled so its longer edge is at most maxSize
+// to keep the image (and its token cost) small; maxSize 0 = keep original size
+async function blobToPng(blob, maxSize)
 {
     const img = await createImageBitmap(blob);
-    const w = maxWidth && img.width > maxWidth ? Math.round(maxWidth) : img.width;
+    const longEdge = Math.max(img.width, img.height);
+    const scale = maxSize && longEdge > maxSize ? maxSize / longEdge : 1;
 
     const canvas = document.createElement("canvas");
-    canvas.width = w;
-    canvas.height = Math.max(1, Math.round(img.height * w / img.width));
+    canvas.width = Math.max(1, Math.round(img.width * scale));
+    canvas.height = Math.max(1, Math.round(img.height * scale));
     canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
     img.close();
 
@@ -344,7 +414,7 @@ async function blobToPng(blob, maxWidth)
 
 // renders a frame and captures it right away with the renderer's own screenshot function (the same as the
 // "save screenshot" command), so the canvas still holds the rendered image instead of an already cleared buffer
-function grabScreenshot(maxWidth)
+function grabScreenshot(maxSize)
 {
     return new Promise((resolve, reject) =>
     {
@@ -355,7 +425,7 @@ function grabScreenshot(maxWidth)
         cg.screenShot((blob) =>
         {
             if (!blob) { reject(new Error("screenshot returned no image")); return; }
-            blobToPng(blob, maxWidth).then(resolve, reject);
+            blobToPng(blob, maxSize).then(resolve, reject);
         }, false, "image/png");
     });
 }
@@ -580,6 +650,70 @@ s.buildList();
 gui.mainTabs.on("onTabRemoved", () => { if (currentServer && currentServer.isConnected()) currentServer.sendResourceListChanged(); });
 gui.mainTabs.on("onTabAdded", () => { if (currentServer && currentServer.isConnected()) currentServer.sendResourceListChanged(); });
 
+function linkLabel(port)
+{
+    return port.op.id + "." + port.name;
+}
+
+function isPlainValuePort(port)
+{
+    const type = port.getType();
+    return type == CABLES.Port.TYPE_VALUE || type == CABLES.Port.TYPE_STRING;
+}
+
+function changedPortValues(o)
+{
+    const values = [];
+    for (let i = 0; i < o.portsIn.length; i++)
+    {
+        const p = o.portsIn[i];
+        if (!isPlainValuePort(p) || p.links.length > 0 || p.get() === p.defaultValue) continue;
+        values.push(p.name + "=" + JSON.stringify(p.get()));
+    }
+    return values;
+}
+
+function patchOverviewLines(subPatch, filter, withValues)
+{
+    const lines = [];
+    const lowerFilter = (filter || "").toLowerCase();
+    const ops = CABLES.patch.ops;
+
+    for (let i = 0; i < ops.length; i++)
+    {
+        const o = ops[i];
+        const opSubPatch = o.uiAttribs.subPatch || "0";
+        if (subPatch !== undefined && opSubPatch != subPatch) continue;
+        if (lowerFilter && (o.objName + " " + o.getTitle()).toLowerCase().indexOf(lowerFilter) == -1) continue;
+
+        let head = o.id + " " + o.objName;
+        if (o.getTitle() != o.objName.split(".").pop()) head += " \"" + o.getTitle() + "\"";
+        if (o.uiAttribs.extendTitle) head += " (" + o.uiAttribs.extendTitle + ")";
+        if (opSubPatch != "0") head += " sub:" + opSubPatch;
+        lines.push(head);
+
+        const incoming = [];
+        for (let j = 0; j < o.portsIn.length; j++)
+            for (let k = 0; k < o.portsIn[j].links.length; k++)
+                incoming.push(o.portsIn[j].name + ": " + linkLabel(o.portsIn[j].links[k].portOut));
+
+        const outgoing = [];
+        for (let j = 0; j < o.portsOut.length; j++)
+            for (let k = 0; k < o.portsOut[j].links.length; k++)
+                outgoing.push(o.portsOut[j].name + ": " + linkLabel(o.portsOut[j].links[k].portIn));
+
+        if (incoming.length) lines.push("  <- " + incoming.join(", "));
+        if (outgoing.length) lines.push("  -> " + outgoing.join(", "));
+
+        if (withValues)
+        {
+            const values = changedPortValues(o);
+            if (values.length) lines.push("  = " + values.join(", "));
+        }
+    }
+    return lines;
+}
+
 function buildMcpServer()
 {
     const server = new McpServer.McpServer({ "name": "cables standalone mcp server", "version": "1.0.0" });
@@ -661,6 +795,61 @@ function buildMcpServer()
     );
 
     server.tool(
+        "read-op",
+        "read the code of an op (or one of its attachments, att_ prefix optional) with line numbers, much cheaper than reading the whole file: fromLine/toLine limit it to a range of lines, find only lists the lines containing that text. use edit-op-text to change it.",
+        { "opname": z.string(), "attachment": z.string().optional(), "fromLine": z.number().optional(), "toLine": z.number().optional(), "find": z.string().optional() },
+        async ({ opname, attachment, fromLine, toLine, find }) =>
+        {
+            logMcp("read op " + opname + (attachment ? "/" + attachmentFileName(attachment) : ""));
+
+            try
+            {
+                const lines = (await readOpText(opname, attachment)).split("\n");
+
+                if (find)
+                {
+                    const found = lines.map((line, i) => (line.includes(find) ? (i + 1) + "\t" + line : null)).filter((line) => line !== null);
+                    return respondText(found.length ? found.join("\n") : "\"" + find + "\" not found");
+                }
+
+                const first = Math.max(1, fromLine || 1);
+                const last = Math.min(lines.length, toLine || lines.length);
+                return respondText(lines.length + " lines\n" + numberedLines(lines.slice(first - 1, last), first));
+            }
+            catch (e)
+            {
+                return respondError("could not read op: " + e.message);
+            }
+        }
+    );
+
+    server.tool(
+        "edit-op-text",
+        "change the code of an op (or one of its attachments, att_ prefix optional) by replacing oldText with newText, without sending the whole file. oldText has to match exactly once (copy it from read-op without the line numbers, include enough surrounding lines to make it unique), or pass replaceAll=true to replace every occurrence. the op is saved and re-executed afterwards.",
+        { "opname": z.string(), "attachment": z.string().optional(), "oldText": z.string(), "newText": z.string(), "replaceAll": z.boolean().optional() },
+        async ({ opname, attachment, oldText, newText, replaceAll }) =>
+        {
+            logMcp("edit op " + opname + (attachment ? "/" + attachmentFileName(attachment) : ""));
+
+            try
+            {
+                const text = await readOpText(opname, attachment);
+                const count = countOccurrences(text, oldText);
+
+                if (!oldText || count == 0) return respondError("oldText not found, nothing changed");
+                if (count > 1 && !replaceAll) return respondError("oldText found " + count + " times, add surrounding lines to make it unique or pass replaceAll=true; nothing changed");
+
+                await writeOpText(opname, attachment, text.split(oldText).join(newText));
+                return respondText("replaced " + count + " occurrence" + (count > 1 ? "s" : "") + ", op saved and executed");
+            }
+            catch (e)
+            {
+                return respondError("could not edit op: " + e.message);
+            }
+        }
+    );
+
+    server.tool(
         "edit-op",
         "open an op to edit and change it",
         { "opname": z.string() },
@@ -674,27 +863,20 @@ function buildMcpServer()
 
     server.tool(
         "search-ops",
-        "search through a list of all available ops; read cables://op/<name> to see an op's source",
-        { "str": z.string() },
-        (str) =>
+        "search through all available ops, best matches first, one per line as \"name: summary\". limit is the number of results (default " + SEARCH_DEFAULT_LIMIT + ", 0 = all). use get-op-docs for ports and docs, read-op for the source.",
+        { "str": z.string(), "limit": z.number().optional() },
+        ({ str, limit }) =>
         {
-            logMcp("search ops \"" + str.str + "\"");
-            s.search(str.str);
-            const data = { "content": [] };
-            for (let i = 0; i < s.list.length; i++)
-            {
-                if (s.list[i].score > 0)
-                {
-                    data.content.push({
-                        "type": "resource_link",
-                        "uri": "cables://op/" + s.list[i].name,
-                        "name": s.list[i].name,
-                        "description": s.list[i].summary
-                    });
-                }
-            }
+            logMcp("search ops \"" + str + "\"");
 
-            return respond(data);
+            // the search only matches lowercase terms
+            s.search(str.toLowerCase());
+            const found = s.list.filter((o) => o.score > 0).sort((a, b) => b.score - a.score);
+            const maxResults = limit ?? SEARCH_DEFAULT_LIMIT;
+            const lines = (maxResults ? found.slice(0, maxResults) : found).map((o) => o.name + ": " + (o.summary || ""));
+
+            if (!lines.length) return respondText("no ops found");
+            return respondText(lines.join("\n") + (lines.length < found.length ? "\n(" + lines.length + " of " + found.length + " results)" : ""));
         }
     );
 
@@ -946,6 +1128,21 @@ function buildMcpServer()
     );
 
     server.tool(
+        "set-op-comment",
+        "set the comment of an op in the patch by its id, shown next to its title in the patch editor (the same as the comment field in the param panel). an empty comment removes it. undoable.",
+        { "opId": z.string(), "comment": z.string() },
+        ({ opId, comment }) =>
+        {
+            logMcp("comment " + opLabel(opId));
+
+            if (!CABLES.patch.getOpById(opId)) return respondError("no op found with id " + opId);
+
+            setOpCommentUndoable(opId, comment);
+            return respondText(comment ? "comment of " + opId + " set" : "comment of " + opId + " removed");
+        }
+    );
+
+    server.tool(
         "focus-op",
         "scroll/zoom the patch editor view to center on an op and open its param panel, so the person looking at the editor can see it. does not affect rendering.",
         { "opId": z.string() },
@@ -961,6 +1158,40 @@ function buildMcpServer()
             gui.patchView.patchRenderer.focusOp(opId);
 
             return respondText("focused " + opId + " (" + targetOp.objName + ") in the patch editor");
+        }
+    );
+
+    server.tool(
+        "get-patch-overview",
+        "compact overview of the current patch, much smaller than cables://patch.json: one line per op with its id, full op name (objName), title and subpatch, followed by its incoming (<-) and outgoing (->) links as port: opId.port. no port values unless values=true, then only the values that differ from the op's defaults (linked ports left out). optional subPatch limits it to one subpatch, filter to ops whose name or title contains the text. use get-patch-op for all values of a single op.",
+        { "subPatch": z.string().optional(), "filter": z.string().optional(), "values": z.boolean().optional() },
+        ({ subPatch, filter, values }) =>
+        {
+            logMcp("patch overview" + (filter ? " \"" + filter + "\"" : ""));
+
+            const lines = patchOverviewLines(subPatch, filter, values);
+            return respondText(lines.length ? lines.join("\n") : "no ops found");
+        }
+    );
+
+    server.tool(
+        "select-op",
+        "select ops in the patch editor, like clicking them. commands from run-command act on the selected ops. opIds is a list of op ids, add true keeps the current selection, otherwise it is cleared first.",
+        { "opIds": z.array(z.string()), "add": z.boolean().optional() },
+        ({ opIds, add }) =>
+        {
+            logMcp("select " + opIds.map((opId) => { return opLabel(opId); }).join(", "));
+
+            if (!CABLES.UI || !gui.patchView) return respondError("no patch editor UI available to select in");
+
+            const missing = opIds.filter((opId) => { return !CABLES.patch.getOpById(opId); });
+            if (missing.length > 0) return respondError("no op found with id " + missing.join(", "));
+
+            if (!add) gui.patchView.unselectAllOps();
+            opIds.forEach((opId) => { gui.patchView.selectOpId(opId); });
+
+            const selected = gui.patchView.getSelectedOps().map((selOp) => { return selOp.id + " (" + selOp.objName + ")"; });
+            return respondText("selected: " + selected.join(", "));
         }
     );
 
@@ -1109,15 +1340,15 @@ function buildMcpServer()
 
     server.tool(
         "screenshot",
-        "take a screenshot of the patch's rendering canvas and return it as a png image; use it to check what a change looks like.",
-        { "maxWidth": z.number().optional() },
-        async ({ maxWidth }) =>
+        "take a screenshot of the patch's rendering canvas and return it as a png image; use it to check what a change looks like. maxSize limits the longer edge in pixels (default " + SCREENSHOT_DEFAULT_MAX_SIZE + ", 0 = original size); larger images cost more tokens.",
+        { "maxSize": z.number().optional() },
+        async ({ maxSize }) =>
         {
             logMcp("screenshot");
 
             try
             {
-                const png = await grabScreenshot(maxWidth || 1024);
+                const png = await grabScreenshot(maxSize ?? SCREENSHOT_DEFAULT_MAX_SIZE);
                 return respond({ "content": [{ "type": "image", "data": png, "mimeType": "image/png" }] });
             }
             catch (e)
@@ -1363,4 +1594,3 @@ op.onDelete = () =>
     if (devToolsSocket) devToolsSocket.close();
     stopServer(httpServer).then(() => { console.log("Server closed"); });
 };
-
