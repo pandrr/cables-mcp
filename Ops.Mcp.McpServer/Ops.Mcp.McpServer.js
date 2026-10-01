@@ -12,6 +12,10 @@ const MCP_PORT = 3000;
 const SCREENSHOT_DEFAULT_MAX_SIZE = 640;
 const SELF_EXECUTE_DELAY_MS = 100;
 const SEARCH_DEFAULT_LIMIT = 20;
+const PATCHFIELD_FRAME_TIMEOUT_MS = 3000;
+const PATCHFIELD_VIEW_ANIM_MS = 500;
+const PATCHFIELD_FIT_PADDING = 1.1;
+const PATCHFIELD_FIT_MIN_SIZE = 250;
 const LISTEN_RETRY_MS = 20;
 const LISTEN_MAX_RETRIES = 1150;
 
@@ -428,6 +432,82 @@ function grabScreenshot(maxSize)
             blobToPng(blob, maxSize).then(resolve, reject);
         }, false, "image/png");
     });
+}
+
+// captures the patch field (the glpatch canvas) right after its next rendered frame, while the drawing buffer still holds the image
+function grabPatchFieldScreenshot(maxSize)
+{
+    return new Promise((resolve, reject) =>
+    {
+        const cgl = gui.patchView.patchRenderer.cgl;
+        const timeout = setTimeout(() => { cgl.off(listener); reject(new Error("patch field did not render a frame")); }, PATCHFIELD_FRAME_TIMEOUT_MS);
+
+        const listener = cgl.on("endFrame", () =>
+        {
+            clearTimeout(timeout);
+            setTimeout(() => { cgl.off(listener); }, 0);
+            cgl.screenShot((blob) =>
+            {
+                if (!blob) { reject(new Error("screenshot returned no image")); return; }
+                blobToPng(blob, maxSize).then(resolve, reject);
+            }, false, "image/png");
+        });
+    });
+}
+
+// size of the patch field in css pixels, the unit of screen coordinates in the viewbox
+function patchFieldSize()
+{
+    const canvas = gui.patchView.patchRenderer.cgl.canvas;
+    return { "w": canvas.clientWidth, "h": canvas.clientHeight };
+}
+
+// the ops of the subpatch currently shown in the patch field
+function visiblePatchOps()
+{
+    const sub = gui.patchView.getCurrentSubPatch();
+    return CABLES.patch.ops.filter((o) => (o.uiAttribs.subPatch || 0) == sub && !o.uiAttribs.hidden);
+}
+
+// viewbox zoom is half the visible width in patch units; scroll y is stored scaled by the aspect ratio
+function setPatchView(x, y, zoom)
+{
+    const viewBox = gui.patchView.patchRenderer.viewBox;
+    const size = patchFieldSize();
+
+    if (zoom) viewBox.animateZoom(zoom);
+    // as user interaction, otherwise the view is shifted to the part of the field not covered by panels, and x/y would not end up in the center
+    if (x !== undefined && y !== undefined) viewBox.animateScrollTo(x, y * size.w / size.h, undefined, true);
+}
+
+function fitPatchView(ops)
+{
+    const bounds = gui.patchView.getOpBounds(ops);
+    const size = patchFieldSize();
+
+    const w = Math.max(bounds.size[0], PATCHFIELD_FIT_MIN_SIZE);
+    const h = Math.max(bounds.size[1], PATCHFIELD_FIT_MIN_SIZE);
+    const zoom = Math.max(w, h * size.w / size.h) / 2 * PATCHFIELD_FIT_PADDING;
+
+    setPatchView(bounds.center[0], bounds.center[1], zoom);
+}
+
+// the visible area of the patch field in patch coordinates, as used by op positions (move-op / uiAttribs.translate)
+function patchViewInfo()
+{
+    const glPatch = gui.patchView.patchRenderer;
+    const size = patchFieldSize();
+    const topLeft = glPatch.screenToPatchCoord(0, 0);
+    const bottomRight = glPatch.screenToPatchCoord(size.w, size.h);
+    const round = (v) => Math.round(v);
+
+    return {
+        "zoom": round(glPatch.viewBox.zoom),
+        "subPatch": gui.patchView.getCurrentSubPatch(),
+        "visible": { "x1": round(topLeft[0]), "y1": round(topLeft[1]), "x2": round(bottomRight[0]), "y2": round(bottomRight[1]) },
+        "center": { "x": round((topLeft[0] + bottomRight[0]) / 2), "y": round((topLeft[1] + bottomRight[1]) / 2) },
+        "fieldSize": size
+    };
 }
 
 // resolves after the next frame has been rendered completely, e.g. so a shader recompile
@@ -1124,6 +1204,56 @@ function buildMcpServer()
             });
 
             return respondText("moved " + opId + " to " + x + "," + y);
+        }
+    );
+
+    server.tool(
+        "patch-view",
+        "scroll/zoom the patch field (the editor's op graph, not the rendering canvas). fit=true zooms to show all ops of the current subpatch, opIds fits the view to those ops, x/y center the view on a patch coordinate (the same coordinates as op positions), zoom is half the visible width in patch units (bigger = further out). without arguments it only reports the current view. returns the visible area in patch coordinates. take a look with patch-field-screenshot.",
+        { "fit": z.boolean().optional(), "opIds": z.array(z.string()).optional(), "x": z.number().optional(), "y": z.number().optional(), "zoom": z.number().optional() },
+        async ({ fit, opIds, x, y, zoom }) =>
+        {
+            logMcp("patch view");
+
+            if (opIds)
+            {
+                const ops = opIds.map((opId) => CABLES.patch.getOpById(opId));
+                const missing = opIds.filter((opId, i) => !ops[i]);
+                if (missing.length) return respondError("no op found with id " + missing.join(", "));
+                fitPatchView(ops);
+            }
+            else if (fit)
+            {
+                const ops = visiblePatchOps();
+                if (!ops.length) return respondError("no ops in the current subpatch");
+                fitPatchView(ops);
+            }
+            else if ((x === undefined) != (y === undefined)) return respondError("pass both x and y");
+            else setPatchView(x, y, zoom);
+
+            // view changes are animated, report the view once they are done
+            await new Promise((resolve) => { setTimeout(resolve, PATCHFIELD_VIEW_ANIM_MS); });
+            return respondText(JSON.stringify(patchViewInfo()));
+        }
+    );
+
+    server.tool(
+        "patch-field-screenshot",
+        "take a screenshot of the patch field (the editor's op graph with ops and links, not the rendering canvas) as a png image. maxSize limits the longer edge in pixels (default " + SCREENSHOT_DEFAULT_MAX_SIZE + ", 0 = original size). use patch-view to scroll/zoom first; panels on top of the patch field are not in the image.",
+        { "maxSize": z.number().optional() },
+        async ({ maxSize }) =>
+        {
+            logMcp("patch field screenshot");
+
+            try
+            {
+                const png = await grabPatchFieldScreenshot(maxSize ?? SCREENSHOT_DEFAULT_MAX_SIZE);
+                return respond({ "content": [{ "type": "image", "data": png, "mimeType": "image/png" }] });
+            }
+            catch (e)
+            {
+                return respondError("patch field screenshot failed: " + e.message);
+            }
         }
     );
 
