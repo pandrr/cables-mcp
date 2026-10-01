@@ -78,6 +78,18 @@ some clients don't expose resources to the ai, so they can also be used with the
 | `move-op` | move an op in the patch field |
 | `tidy-up-ops` | arrange the selected ops in rows following their links (undoable) |
 
+### timeline and keyframes
+
+| tool | |
+|---|---|
+| `timeline` | play/pause the timeline, set its time, or report time and play state |
+| `set-port-animated` | make a number input port animated or not animated (undoable) |
+| `get-anim` | keyframes (time, value, easing), loop mode, length and current value of an animated port |
+| `set-keyframes` | add or change keyframes with easings, optionally clear first and set the loop mode (undoable) |
+| `delete-keyframes` | delete keyframes by their time (undoable) |
+
+an animation can be reused: animate the `Value` port of `Ops.TimeLine.Anim` and link its `Anim` output to several `Ops.TimeLine.AnimGetValue` ops.
+
 ### rendering
 
 | tool | |
