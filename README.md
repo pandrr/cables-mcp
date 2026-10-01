@@ -15,6 +15,6 @@ USE WITH CAUTION
 #### add mcp server to terminal claude code
 
 ```
-claude mcp add --transport http my-server http://localhost:3000/mcp
+claude mcp add --transport http cables http://localhost:3000/mcp
 ```
 
