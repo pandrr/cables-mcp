@@ -2580,6 +2580,72 @@ function buildMcpServer()
         }
     );
 
+    server.tool(
+        "ui-profiler-start",
+        "clear the editor's ui profiler and start measuring from now on (the same data as the ui profiler tab). every gui.uiProfiler.start(name)/finish() in the ui code is one measurement. do the actions to measure afterwards (e.g. select ops, drag, reload), then read the result with ui-profiler-read.",
+        {},
+        () =>
+        {
+            logMcp("ui profiler start");
+
+            gui.uiProfiler.ignore = false;
+            gui.uiProfiler.clear();
+            window.cablesMcpUiProfilerStarted = performance.now();
+            return respondText("ui profiler cleared and measuring");
+        }
+    );
+
+    server.tool(
+        "ui-profiler-read",
+        "read the ui profiler measurements since ui-profiler-start: per measured name the count, average/max/last time in ms (over the most recent times the profiler keeps, see keptTimes) and estTotalMs (count * average). sorted by estTotalMs, so the biggest cost is first. optional filter only lists names containing that text, limit the number of entries (default 30).",
+        { "filter": z.string().optional(), "limit": z.number().optional() },
+        ({ filter, limit }) =>
+        {
+            logMcp("ui profiler read");
+
+            const measures = gui.uiProfiler._measures;
+            const entries = [];
+            for (const name in measures)
+            {
+                if (filter && name.indexOf(filter) == -1) continue;
+
+                const times = measures[name].times || [];
+                if (!times.length) continue;
+
+                let sum = 0;
+                let max = 0;
+                for (let i = 0; i < times.length; i++)
+                {
+                    sum += times[i];
+                    max = Math.max(max, times[i]);
+                }
+                const avg = sum / times.length;
+                const round = (v) => Math.round(v * 1000) / 1000;
+
+                const entry = {
+                    "name": name,
+                    "count": measures[name].count,
+                    "avgMs": round(avg),
+                    "maxMs": round(max),
+                    "lastMs": round(times[times.length - 1]),
+                    "estTotalMs": round(avg * measures[name].count),
+                    "keptTimes": times.length
+                };
+                if (measures[name].text) entry.text = measures[name].text;
+                entries.push(entry);
+            }
+
+            entries.sort((a, b) => b.estTotalMs - a.estTotalMs);
+
+            const result = {
+                "measuringMs": window.cablesMcpUiProfilerStarted ? Math.round(performance.now() - window.cablesMcpUiProfilerStarted) : null,
+                "numNames": entries.length,
+                "entries": entries.slice(0, limit || 30)
+            };
+            return respondText(JSON.stringify(result, null, 1));
+        }
+    );
+
     return server;
 }
 
