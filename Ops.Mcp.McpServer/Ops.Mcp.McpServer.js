@@ -576,6 +576,32 @@ function grabPatchFieldScreenshot(maxSize)
     });
 }
 
+// captures the timeline canvas right after a frame it renders; only the gl part, the html line titles on top are not in the image
+function grabTimelineScreenshot(maxSize)
+{
+    return new Promise((resolve, reject) =>
+    {
+        const glTimeline = gui.glTimeline;
+        if (!glTimeline) { reject(new Error("timeline is not open, run the command \"Show timeline\" first")); return; }
+
+        const cgl = glTimeline.cgl;
+        const timeout = setTimeout(() => { cgl.off(listener); reject(new Error("timeline did not render a frame")); }, PATCHFIELD_FRAME_TIMEOUT_MS);
+
+        const listener = cgl.on("endFrame", () =>
+        {
+            clearTimeout(timeout);
+            setTimeout(() => { cgl.off(listener); }, 0);
+            cgl.screenShot((blob) =>
+            {
+                if (!blob) { reject(new Error("screenshot returned no image")); return; }
+                blobToPng(blob, maxSize).then(resolve, reject);
+            }, false, "image/png");
+        });
+
+        glTimeline.needsUpdateAll = "mcp screenshot";
+    });
+}
+
 // size of the patch field in css pixels, the unit of screen coordinates in the viewbox
 function patchFieldSize()
 {
@@ -1771,9 +1797,9 @@ function buildMcpServer()
 
     server.tool(
         "timeline",
-        "control the timeline: play (true plays, false pauses) and time (jump to a time in seconds). without arguments it only reports the current time and whether it is playing. animated ports and Ops.TimeLine.* ops follow this time.",
-        { "play": z.boolean().optional(), "time": z.number().optional() },
-        ({ play, time }) =>
+        "control the timeline: play (true plays, false pauses) and time (jump to a time in seconds). viewStart/viewLength scroll/zoom the timeline panel so it shows viewLength seconds starting at viewStart (animated, the reported view is from before the change). without arguments it only reports the current time, whether it is playing and, if the timeline panel is open, its view. animated ports and Ops.TimeLine.* ops follow this time.",
+        { "play": z.boolean().optional(), "time": z.number().optional(), "viewStart": z.number().optional(), "viewLength": z.number().optional() },
+        ({ play, time, viewStart, viewLength }) =>
         {
             const timer = CABLES.patch.timer;
             logMcp("timeline" + (play !== undefined ? (play ? " play" : " pause") : "") + (time !== undefined ? " time " + time : ""));
@@ -1782,7 +1808,17 @@ function buildMcpServer()
             if (play === true) timer.play();
             if (play === false) timer.pause();
 
-            return respondText(JSON.stringify({ "time": round3(timer.getTime()), "playing": timer.isPlaying() }));
+            const result = { "time": round3(timer.getTime()), "playing": timer.isPlaying() };
+            const glTimeline = gui.glTimeline;
+            if (glTimeline)
+            {
+                result.view = { "start": round3(glTimeline.view.timeLeft), "length": round3(glTimeline.view.visibleTime), "saved": glTimeline.savePatchData().view };
+                if (viewLength !== undefined) glTimeline.view.setZoomLength(viewLength);
+                if (viewStart !== undefined) glTimeline.view.scrollTo(viewStart);
+            }
+            else if (viewStart !== undefined || viewLength !== undefined) return respondError("timeline is not open, run the command \"Show timeline\" first");
+
+            return respondText(JSON.stringify(result));
         }
     );
 
@@ -2042,6 +2078,53 @@ function buildMcpServer()
             catch (e)
             {
                 return respondError("patch field screenshot failed: " + e.message);
+            }
+        }
+    );
+
+    server.tool(
+        "perf-profiler-read",
+        "read the patch's perf profiler (the per-frame durations and counts the code reports with perfProfiler.setDuration/addCount, e.g. \"timeline cpu\" or \"<canvas> gpu\" from gl timer queries): per name the average, max and last value over the kept frames (default 120). optional filter only lists names containing that text.",
+        { "filter": z.string().optional() },
+        ({ filter }) =>
+        {
+            logMcp("perf profiler read");
+
+            const profiler = CABLES.patch.perfProfiler;
+            const summarize = (frames, key) =>
+            {
+                const values = frames.map((f) => f[key]).filter((v) => typeof v == "number");
+                if (!values.length) return null;
+                const sum = values.reduce((a, b) => a + b, 0);
+                return { "avg": round3(sum / values.length), "max": round3(Math.max(...values)), "last": round3(values[values.length - 1]), "frames": values.length };
+            };
+
+            const result = { "durationsMs": {}, "counts": {} };
+            for (const name in profiler.durationsFrames)
+                if (!filter || name.includes(filter)) result.durationsMs[name] = summarize(profiler.durationsFrames[name], "ms");
+            for (const name in profiler.countsFrames)
+                if (!filter || name.includes(filter)) result.counts[name] = summarize(profiler.countsFrames[name], "num");
+
+            return respondText(JSON.stringify(result));
+        }
+    );
+
+    server.tool(
+        "timeline-screenshot",
+        "take a screenshot of the timeline panel (ruler, overview, keys and curves) as a png image. only the gl canvas: the html line titles and buttons are not in the image. maxSize limits the longer edge in pixels (default " + SCREENSHOT_DEFAULT_MAX_SIZE + ", 0 = original size). the timeline has to be open (command \"Show timeline\").",
+        { "maxSize": z.number().optional() },
+        async ({ maxSize }) =>
+        {
+            logMcp("timeline screenshot");
+
+            try
+            {
+                const png = await grabTimelineScreenshot(maxSize ?? SCREENSHOT_DEFAULT_MAX_SIZE);
+                return respond({ "content": [{ "type": "image", "data": png, "mimeType": "image/png" }] });
+            }
+            catch (e)
+            {
+                return respondError("timeline screenshot failed: " + e.message);
             }
         }
     );
