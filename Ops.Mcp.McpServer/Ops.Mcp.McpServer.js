@@ -38,6 +38,7 @@ const CLEANUP_SMALL_BRANCH_FACTOR = 2;
 const CLEANUP_FANOUT_MIN_CHILDREN = 3;
 const LISTEN_RETRY_MS = 20;
 const LISTEN_MAX_RETRIES = 1150;
+const RELOAD_EDITOR_DELAY_MS = 300;
 
 const DEVTOOLS_PORT = 9222;
 const CONSOLE_MAX_ENTRIES = 1000;
@@ -310,7 +311,7 @@ function logMcp(_log)
 }
 
 // the log port starts with this line instead of "", relinking after an op reload copies the current value to the logger
-logMcp("mcp server loading");
+logMcp("mcp server starting");
 
 // readable name of an op for the log, e.g. "Rectangle" instead of its id
 function opLabel(opId)
@@ -2509,6 +2510,76 @@ function buildMcpServer()
         }
     );
 
+    server.tool(
+        "get-build-info",
+        "build info of the code that is running in the editor right now (compiled into the bundles, not read from disk): when the ui and core were built and from which git commit. ageSeconds is how long ago that was. use it after reloading the editor to check that a change is live: created has to be newer than the edit. serverStarted is when this mcp server started (changes with every editor reload), loading/runningJobs tell if the editor or patch is still loading.",
+        {},
+        () =>
+        {
+            logMcp("get build info");
+
+            const now = Date.now();
+            const describe = (build) =>
+            {
+                if (!build) return null;
+                const r = { "created": build.created, "ageSeconds": Math.round((now - build.timestamp) / 1000) };
+                if (build.git) r.git = { "branch": build.git.branch, "commit": build.git.commit, "message": build.git.message };
+                return r;
+            };
+
+            const loaderInfo = (window.CABLESUILOADER && CABLESUILOADER.buildInfo) || {};
+
+            let runningJobs = 0;
+            const uiJobs = gui.jobs().getList();
+            for (let i = 0; i < uiJobs.length; i++) if (!uiJobs[i].finished) runningJobs++;
+            const patchTasks = gui.corePatch().loading.getList();
+            for (let i = 0; i < patchTasks.length; i++) if (!patchTasks[i].finished) runningJobs++;
+
+            return respondText(JSON.stringify({
+                "now": new Date(now).toISOString(),
+                "serverStarted": window.cablesMcpServerStarted,
+                "loading": runningJobs > 0,
+                "runningJobs": runningJobs,
+                "ui": describe(CABLES.UI.build || loaderInfo.ui),
+                "core": describe(CABLES.build || loaderInfo.core),
+                "api": describe(loaderInfo.api)
+            }, null, 1));
+        }
+    );
+
+    server.tool(
+        "reload-editor",
+        "reload the whole editor page, e.g. to load newly built ui code. this mcp server restarts with it, so the answer only confirms the reload was triggered. afterwards poll get-build-info until it answers again with a newer serverStarted and loading false. with unsaved changes it does not reload (the editor would block on a leave-page dialog) unless unsaved is \"save\" (save the patch first) or \"discard\" (reload without saving, the changes are lost).",
+        { "unsaved": z.enum(["save", "discard"]).optional() },
+        async ({ unsaved }) =>
+        {
+            logMcp("reload editor" + (unsaved ? " (" + unsaved + " unsaved)" : ""));
+
+            const cmd = CABLES.CMD.commands.find((c) => c && c.cmd == "Reload Editor");
+            if (!cmd || !cmd.func) return respondError("no \"Reload Editor\" command found");
+
+            if (!gui.savedState.isSaved)
+            {
+                if (unsaved == "save")
+                {
+                    try
+                    {
+                        await savePatch();
+                    }
+                    catch (e)
+                    {
+                        return respondError("not reloading, save failed: " + e.message);
+                    }
+                }
+                else if (unsaved == "discard") gui.savedState.setSavedAll("mcp reload-editor");
+                else return respondError("not reloading: the patch has unsaved changes, call again with unsaved \"save\" or \"discard\"");
+            }
+
+            setTimeout(() => { cmd.func(); }, RELOAD_EDITOR_DELAY_MS);
+            return respondText(JSON.stringify({ "reloading": true, "serverStarted": window.cablesMcpServerStarted }));
+        }
+    );
+
     return server;
 }
 
@@ -2547,8 +2618,18 @@ function stopServer(server)
 }
 
 // the port can still be in use for a moment after the previous server was stopped, so retry instead of giving up
+const instanceToken = {};
+window.cablesMcpInstance = instanceToken;
+
+function isCurrentInstance()
+{
+    return window.cablesMcpInstance === instanceToken;
+}
+
 function listen(retriesLeft)
 {
+    if (!isCurrentInstance()) return;
+
     const onListenError = (e) =>
     {
         if (e.code === "EADDRINUSE" && retriesLeft > 0)
@@ -2563,9 +2644,15 @@ function listen(retriesLeft)
     httpServer.listen(MCP_PORT, () =>
     {
         httpServer.off("error", onListenError);
+        if (!isCurrentInstance())
+        {
+            stopServer(httpServer);
+            return;
+        }
         httpServer.on("error", (e) => { logMcp("mcp server error: " + e.message); });
 
         window.cablesMcpHttpServer = httpServer;
+        window.cablesMcpServerStarted = new Date().toISOString();
         window.cablesMcpServerStarts = (window.cablesMcpServerStarts || 0) + 1;
 
         logMcp("mcp server " + (window.cablesMcpServerStarts > 1 ? "restarted" : "started") + " on port " + MCP_PORT);
@@ -2578,11 +2665,36 @@ function listen(retriesLeft)
 connectDevTools().catch(() => {});
 
 // after an op reload the server of the previous instance may still be running, it has to release the port first
-stopServer(window.cablesMcpHttpServer).then(() => { listen(LISTEN_MAX_RETRIES); });
-
-op.onDelete = () =>
+op.startMcpServer = () =>
 {
+    window.cablesMcpInstance = instanceToken;
+    stopServer(window.cablesMcpHttpServer).then(() => { listen(LISTEN_MAX_RETRIES); });
+};
+op.startMcpServer();
+
+function checkSingleServerOp()
+{
+    const serverOps = op.patch.getOpsByObjName(op.objName);
+    if (serverOps.length > 1) op.setUiError("multipleServerOps", "there are " + serverOps.length + " " + op.objName + " ops in this patch, only one of them can run the mcp server. delete the others.", 2);
+    else op.setUiError("multipleServerOps", null);
+}
+
+const opAddedListener = op.patch.on(CABLES.Patch.EVENT_OP_ADDED, checkSingleServerOp);
+const opDeletedListener = op.patch.on(CABLES.Patch.EVENT_OP_DELETED, checkSingleServerOp);
+checkSingleServerOp();
+
+// when the running server op is deleted (not reloaded) another server op in the patch takes over
+op.onDelete = (reloadingOp) =>
+{
+    const wasRunning = isCurrentInstance();
+logMcp("stop mcp server");
     if (window.cablesMcpHttpServer === httpServer) window.cablesMcpHttpServer = null;
+    if (isCurrentInstance()) window.cablesMcpInstance = null;
+    op.patch.off(opAddedListener);
+    op.patch.off(opDeletedListener);
+
+    const otherServerOps = op.patch.getOpsByObjName(op.objName);
+    if (wasRunning && !reloadingOp && otherServerOps.length > 0 && otherServerOps[0].startMcpServer) otherServerOps[0].startMcpServer();
     if (devToolsSocket) devToolsSocket.close();
     stopServer(httpServer).then(() => { console.log("Server closed"); });
 };
