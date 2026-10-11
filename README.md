@@ -34,6 +34,18 @@ any other mcp client that supports http transport works the same, the endpoint i
 npm run start -- --remote-debugging-port=9222
 ```
 
+the McpServer op connects to `localhost:9222` itself, so `get-console-logs` works without any further setup. without the debug port it returns nothing.
+
+electron only opens the debug port on `127.0.0.1` of the machine it runs on. to use it from somewhere else (e.g. an ai agent running in a vm), forward it with a reverse ssh tunnel, started on the machine running cables standalone:
+
+```
+ssh -N -R 9222:localhost:9222 user@vm-host
+```
+
+the port is then available as `localhost:9222` on the other machine, e.g. `curl http://localhost:9222/json/version` shows the browser and `/json` the open pages. the tunnel runs until it is stopped (ctrl+c).
+
+anyone who can reach the debug port has full control over the editor (it can run any code), so never expose it on a network.
+
 ## what the ai can do
 
 ops in the patch are identified by their op id, ports by their name. use `get-patch-overview` or `cables://patch.json` to find them.
@@ -66,6 +78,18 @@ some clients don't expose resources to the ai, so they can also be used with the
 | `save-patch` | save the patch (like ctrl+s) |
 | `set-patch-name` | rename the patch |
 | `upload-file` | upload a file into the patch's asset folder, from a url or base64 content |
+| `clear-patch` | delete all ops except the McpServer op and the ops linked to it (e.g. its logger) |
+| `upgrade-ops` | replace ops with the newest version of their op, like "Upgrade selected ops", or all outdated ops with `all` |
+| `downgrade-ops` | replace ops with the previous version of their op, like "Downgrade selected op" |
+
+### patches from cables.gl
+
+| tool | |
+|---|---|
+| `load-patch-json` | download a public patch by id, short id or url and add its ops to the current subpatch, like pasting them |
+| `load-example-patch` | the same with the example patch of an op, by op name (falls back to the example of an older version) |
+
+file ports pointing at `/assets/...` are rewritten to load from `https://devsandbox.cables.gl/assets/...`. ops that are not available locally (e.g. user or patch ops) are left out and reported. `clear` deletes all ops first, like `clear-patch`.
 
 ### patch editor view
 
@@ -77,6 +101,7 @@ some clients don't expose resources to the ai, so they can also be used with the
 | `select-op` | select ops, like clicking them |
 | `move-op` | move an op in the patch field |
 | `tidy-up-ops` | arrange the selected ops in rows following their links (undoable) |
+| `timeline-screenshot` | screenshot of the timeline panel |
 
 ### timeline and keyframes
 
@@ -111,6 +136,7 @@ an animation can be reused: animate the `Value` port of `Ops.TimeLine.Anim` and 
 | `list-op-attachments` | list the attachment files of an op |
 | `read-op-attachment` | read an attachment |
 | `write-op-attachment` | write or create an attachment |
+| `delete-op-attachment` | delete an attachment |
 | `write-opened-resources` | write a file that is opened in the code editor |
 
 ### editor
@@ -121,10 +147,34 @@ an animation can be reused: animate the `Value` port of `Ops.TimeLine.Anim` and 
 | `run-command` | run an editor command, e.g. "Reload Editor" |
 | `get-console-logs` | read the editor console, including webgl warnings (needs `--remote-debugging-port=9222`) |
 | `get-jobs` | what the editor and the patch are currently loading, to find stuck loading |
+| `get-build-info` | when the running ui and core were built and from which commit, to check a change is live |
+| `reload-editor` | reload the editor page, optionally saving or discarding unsaved changes |
+| `perf-profiler-read` | per frame durations and counts of the patch's perf profiler |
+| `ui-profiler-start` / `ui-profiler-read` | measure the editor's own ui code |
 | `debug-glop` | temporary debugging tool for the patch field |
 
 ### good to know
 
 - editing an op's code re-executes it: all instances of the op are recreated and get new op ids, so get them again afterwards.
 - only one op can be opened in the code editor at a time.
-- the McpServer op itself can be edited through mcp, the server restarts after the change.
+- the McpServer op itself can be edited through mcp, the server restarts after the change. until it is listening again (a few seconds) requests fail, and a broken change stops the server, so it can not be fixed through mcp anymore.
+
+### code structure
+
+the op code is split into include attachments (`att_inc_*.js`), they are put in front of the op code in alphabetical order:
+
+| file | |
+|---|---|
+| `Ops.Mcp.McpServer.js` | ports, shared helpers, all tool and resource definitions (`buildMcpServer`), the http server |
+| `att_inc_anim.js` | animated ports: keyframes and easings |
+| `att_inc_console.js` | the editor console via the devtools protocol |
+| `att_inc_opfiles.js` | reading and writing op code and attachments |
+| `att_inc_patchinfo.js` | patch errors and the patch overview |
+| `att_inc_patchjson.js` | loading patches from cables.gl, upgrading/downgrading ops, clearing the patch |
+| `att_inc_patchview.js` | scrolling/zooming the patch field |
+| `att_inc_screenshots.js` | screenshots of the canvas, the patch field and the timeline |
+| `att_inc_tidyup.js` | the layout of `tidy-up-ops` |
+
+an include must not use constants of the main op code at the top level, only inside functions. constants that are used while the server is built (e.g. in tool descriptions) stay in the main op code.
+
+changing includes and main code at once is not possible with single edits: write new functions to an include first (a function declared twice is fine, the one in the main code wins), then remove them from the main code. a constant declared twice is a syntax error.
