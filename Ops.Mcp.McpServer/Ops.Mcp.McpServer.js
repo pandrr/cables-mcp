@@ -1014,7 +1014,9 @@ function listen(retriesLeft)
         window.cablesMcpServerStarted = new Date().toISOString();
         window.cablesMcpServerStarts = (window.cablesMcpServerStarts || 0) + 1;
 
-        logMcp("mcp server " + (window.cablesMcpServerStarts > 1 ? "restarted" : "started") + " on port " + MCP_PORT);
+        let startLog = "mcp server " + (window.cablesMcpServerStarts > 1 ? "restarted" : "started") + " on port " + MCP_PORT;
+        if (window.cablesMcpServerStarts == 1) startLog += ", " + Object.keys(currentServer._registeredTools).length + " tools";
+        logMcp(startLog);
         console.log("MCP server listening on http://localhost:" + MCP_PORT + "/mcp");
         outStarted.set(true);
     });

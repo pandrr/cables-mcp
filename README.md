@@ -129,7 +129,7 @@ an animation can be reused: animate the `Value` port of `Ops.TimeLine.Anim` and 
 | `search-ops` | search all available ops by name and summary |
 | `list-op-docs` | list all documented ops |
 | `get-op-docs` | docs of an op: summary, description, ports, dependencies, newer versions |
-| `read-op` | read op code with line numbers, or a range of lines, or only lines containing a text |
+| `read-op` | read op code with line numbers, or a range of lines, or only lines containing a text (also searches the op's `att_inc_*.js` includes, with file names) |
 | `edit-op-text` | change op code by replacing a text, the op is saved and re-executed |
 | `edit-op` | open an op in the code editor and change it |
 | `create-op` | create a new op, optionally with code and attachments |
@@ -161,20 +161,20 @@ an animation can be reused: animate the `Value` port of `Ops.TimeLine.Anim` and 
 
 ### code structure
 
-the op code is split into include attachments (`att_inc_*.js`), they are put in front of the op code in alphabetical order:
+the op code is split into include attachments (`att_inc_*.js`), they are put in front of the op code in alphabetical order. each include has the helpers and the tools of one area, its `register...Tools(server)` function defines the tools and is called by `buildMcpServer`:
 
 | file | |
 |---|---|
-| `Ops.Mcp.McpServer.js` | ports, shared helpers, all tool and resource definitions (`buildMcpServer`), the http server |
-| `att_inc_anim.js` | animated ports: keyframes and easings |
-| `att_inc_console.js` | the editor console via the devtools protocol |
-| `att_inc_opfiles.js` | reading and writing op code and attachments |
-| `att_inc_patchinfo.js` | patch errors and the patch overview |
+| `Ops.Mcp.McpServer.js` | ports, shared helpers, resources and the remaining tools (ports, links, ops, saving, commands, op docs, profilers, build info, reload), `buildMcpServer`, the http server |
+| `att_inc_anim.js` | timeline, animated ports, keyframes and easings |
+| `att_inc_console.js` | `get-console-logs`: the editor console via the devtools protocol |
+| `att_inc_opfiles.js` | reading, editing and creating op code and attachments |
+| `att_inc_patchinfo.js` | patch errors, the patch overview, a single patch op |
 | `att_inc_patchjson.js` | loading patches from cables.gl, upgrading/downgrading ops, clearing the patch |
-| `att_inc_patchview.js` | scrolling/zooming the patch field |
+| `att_inc_patchview.js` | scrolling/zooming the patch field, focusing, selecting and moving ops |
 | `att_inc_screenshots.js` | screenshots of the canvas, the patch field and the timeline |
-| `att_inc_tidyup.js` | the layout of `tidy-up-ops` |
+| `att_inc_tidyup.js` | `tidy-up-ops` and its layout |
 
-an include must not use constants of the main op code at the top level, only inside functions. constants that are used while the server is built (e.g. in tool descriptions) stay in the main op code.
+an include must not use constants of the main op code at the top level, only inside functions. the `register...Tools` functions run while the server is built, so constants they use in tool descriptions or schemas have to be declared before `buildMcpServer()` is called, or in an include.
 
 changing includes and main code at once is not possible with single edits: write new functions to an include first (a function declared twice is fine, the one in the main code wins), then remove them from the main code. a constant declared twice is a syntax error.
