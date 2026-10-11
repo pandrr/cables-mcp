@@ -1,12 +1,14 @@
 const McpServer = op.require("@modelcontextprotocol/sdk/server/mcp.js");
 const StreamableHTTPServerTransport = op.require("@modelcontextprotocol/sdk/server/streamableHttp.js");
 const http = op.require("node:http");
+const https = op.require("node:https");
+const { Buffer } = op.require("node:buffer");
 const { z } = op.require("zod");
 
 const
     outStarted = op.outBoolNum("Started", false),
     outData = op.outObject("Last Request Data"),
-    outLog = op.outString("Log","");
+    outLog = op.outString("Log", "");
 
 const MCP_PORT = 3000;
 const SCREENSHOT_DEFAULT_MAX_SIZE = 640;
@@ -39,6 +41,14 @@ const CLEANUP_FANOUT_MIN_CHILDREN = 3;
 const LISTEN_RETRY_MS = 20;
 const LISTEN_MAX_RETRIES = 1150;
 const RELOAD_EDITOR_DELAY_MS = 300;
+const PATCH_SERVER_URL = "https://cables.gl";
+const PATCH_ASSET_SERVER_URL = "https://devsandbox.cables.gl/";
+const ASSETS_PATH = "/assets/";
+const DOWNLOAD_MAX_REDIRECTS = 5;
+const PASTE_TIMEOUT_MS = 60000;
+const PASTE_GAP_X = 300;
+const REPLACE_OP_TIMEOUT_MS = 15000;
+const REPLACE_OP_POLL_MS = 50;
 
 const DEVTOOLS_PORT = 9222;
 const CONSOLE_MAX_ENTRIES = 1000;
@@ -52,7 +62,6 @@ let devToolsConnecting = null;
 
 let currentServer = null;
 buildMcpServer();
-
 
 function urlName(name)
 {
@@ -76,7 +85,8 @@ function listOpenTabResources()
     {
         const tab = gui.mainTabs.tabs[i];
         if (tab.editor)
-            resources.push({
+            resources.push(
+            {
                 "uri": "mcpfile:///" + urlName(tab.editor.options.name),
                 "name": tab.editor.options.name,
                 "title": tab.editor.options.title,
@@ -132,6 +142,263 @@ async function urlToDataUrl(url)
         reader.onerror = () => { reject(reader.error); };
         reader.readAsDataURL(blob);
     });
+}
+
+// downloads a url with node (no cors restrictions) and resolves with its content as a buffer
+function downloadBuffer(url, redirectsLeft = DOWNLOAD_MAX_REDIRECTS)
+{
+    return new Promise((resolve, reject) =>
+    {
+        https.get(url, (res) =>
+        {
+            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirectsLeft > 0)
+            {
+                res.resume();
+                resolve(downloadBuffer(new URL(res.headers.location, url).href, redirectsLeft - 1));
+                return;
+            }
+            if (res.statusCode != 200)
+            {
+                res.resume();
+                reject(new Error("download failed: " + res.statusCode + " " + url));
+                return;
+            }
+            const chunks = [];
+            res.on("data", (chunk) => { chunks.push(chunk); });
+            res.on("end", () => { resolve(Buffer.concat(chunks)); });
+            res.on("error", reject);
+        }).on("error", reject);
+    });
+}
+
+// accepts a patch id/short id or a patch url like https://cables.gl/p/<id> or /edit/<id>
+function parsePatchId(str)
+{
+    const match = str.match(/\/(?:p|edit|view|api\/project)\/([^/?#]+)/);
+    if (match) return match[1];
+    return str.trim();
+}
+
+// points all file/url ports of a patch at the asset server (/assets/... and assets/... become <assetServer>/assets/...), so its files load without being downloaded first. returns the number of rewritten port values
+function rewritePatchAssetUrls(project, assetServer)
+{
+    const prefix = assetServer.endsWith("/") ? assetServer : assetServer + "/";
+    let count = 0;
+
+    for (let i = 0; i < project.ops.length; i++)
+    {
+        const portsIn = project.ops[i].portsIn || [];
+        for (let j = 0; j < portsIn.length; j++)
+        {
+            const value = portsIn[j].value;
+            if (typeof value != "string") continue;
+
+            let path = null;
+            if (value.startsWith(ASSETS_PATH)) path = value.substring(1);
+            else if (value.startsWith(ASSETS_PATH.substring(1))) path = value;
+            if (path === null) continue;
+
+            portsIn[j].value = prefix + path;
+            count++;
+        }
+    }
+    return count;
+}
+
+// adds the ops of a serialized patch to the current subpatch the same way pasting does: loads op dependencies, gives the ops new ids, adds one undo step
+function pasteProject(project, x, y)
+{
+    return new Promise((resolve) =>
+    {
+        const str = JSON.stringify(project);
+        const pasteEvent = {
+            "clipboardData": { "types": ["text/plain"], "getData": () => str },
+            "preventDefault": () => {}
+        };
+        gui.patchView.clipboardPaste(pasteEvent, gui.patchView.getCurrentSubPatch(), x, y, (ops) => { resolve(ops || []); });
+    });
+}
+
+// the example patch id of an op, or of its newest older version that has one
+function findExamplePatch(opDoc)
+{
+    if (opDoc.exampleProjectId) return { "opName": opDoc.name, "patchId": opDoc.exampleProjectId };
+
+    const versions = opDoc.versions || [];
+    let index = -1;
+    for (let i = 0; i < versions.length; i++)
+        if (versions[i].name == opDoc.name) index = i;
+
+    for (let i = index - 1; i >= 0; i--)
+    {
+        const olderDoc = gui.opDocs.getOpDocByName(versions[i].name);
+        if (olderDoc && olderDoc.exampleProjectId) return { "opName": olderDoc.name, "patchId": olderDoc.exampleProjectId };
+    }
+    return null;
+}
+
+// downloads a patch json from the server and adds its ops to the current subpatch, returns the tool response
+async function loadPatchJson(patchId, { clear, x, y, server, assetServer }, note)
+{
+    const url = (server || PATCH_SERVER_URL) + "/api/project/" + encodeURIComponent(patchId) + "/patch.json";
+
+    let patch;
+    try
+    {
+        patch = JSON.parse((await downloadBuffer(url)).toString("utf-8"));
+    }
+    catch (e)
+    {
+        return respondError("could not load patch " + patchId + " from " + url + ": " + e.message);
+    }
+    if (!patch || !patch.ops) return respondError("no ops in patch " + patchId + " (" + url + ")");
+
+    const numAssetUrls = rewritePatchAssetUrls(patch, assetServer || PATCH_ASSET_SERVER_URL);
+
+    let numDeleted = 0;
+    if (clear) numDeleted = clearPatchKeepMcp();
+
+    const pos = freePastePosition();
+    const numOps = patch.ops.length;
+    const pastedOps = await withTimeout(pasteProject({ "ops": patch.ops }, x === undefined ? pos.x : x, y === undefined ? pos.y : y), PASTE_TIMEOUT_MS, "paste");
+
+    const lines = ["loaded \"" + patch.name + "\" (" + patchId + "): added " + pastedOps.length + " of " + numOps + " ops"];
+    if (note) lines.push(note);
+    if (pastedOps.length < numOps) lines.push((numOps - pastedOps.length) + " ops are not available locally and were left out");
+    if (numDeleted) lines.push("deleted " + numDeleted + " ops before");
+    if (numAssetUrls) lines.push("pointed " + numAssetUrls + " file ports at " + (assetServer || PATCH_ASSET_SERVER_URL));
+    return respondText(lines.join("\n"));
+}
+
+// the newest version of an outdated op, null when it is the newest
+function getNewestVersionName(o)
+{
+    const opDoc = gui.opDocs.getOpDocById(o.opId);
+    if (opDoc && opDoc.oldVersion && opDoc.newestVersion && opDoc.newestVersion.name) return opDoc.newestVersion.name;
+    return null;
+}
+
+// the version before an op, null when it is the first one
+function getPreviousVersionName(o)
+{
+    const opDoc = gui.opDocs.getOpDocByName(o.objName);
+    if (!opDoc || !opDoc.versions) return null;
+
+    let previous = null;
+    for (let i = 0; i < opDoc.versions.length; i++)
+    {
+        if (opDoc.versions[i].name == o.objName) return previous;
+        previous = opDoc.versions[i].name;
+    }
+    return null;
+}
+
+// replaces an op with another version like the upgrade/downgrade commands do: copies port values, links and position.
+// resolves with the new op and the names of linked ports the new version does not have (their links are lost)
+function replaceOpVersion(o, newName)
+{
+    const linkedPorts = [];
+    const ports = o.portsIn.concat(o.portsOut);
+    for (let i = 0; i < ports.length; i++)
+        if (ports[i].links.length) linkedPorts.push(ports[i].name);
+
+    const before = new Set();
+    for (let i = 0; i < CABLES.patch.ops.length; i++) before.add(CABLES.patch.ops[i].id);
+
+    const oldId = o.id;
+    gui.patchView.replaceOp(oldId, newName);
+
+    // replaceOp only calls back after switching subpatches, so wait until the old op is gone and the new one is there
+    return new Promise((resolve) =>
+    {
+        const check = () =>
+        {
+            let newOp = null;
+            for (let i = 0; i < CABLES.patch.ops.length; i++)
+                if (!before.has(CABLES.patch.ops[i].id) && CABLES.patch.ops[i].objName == newName) newOp = CABLES.patch.ops[i];
+
+            if (!newOp || CABLES.patch.getOpById(oldId))
+            {
+                setTimeout(check, REPLACE_OP_POLL_MS);
+                return;
+            }
+
+            const lostLinks = [];
+            for (let i = 0; i < linkedPorts.length; i++)
+                if (!newOp.getPort(linkedPorts[i])) lostLinks.push(linkedPorts[i]);
+
+            resolve({ "newOp": newOp, "lostLinks": lostLinks });
+        };
+        check();
+    });
+}
+
+// upgrades/downgrades ops one after another, getTargetName returns the version to replace an op with, or null to skip it
+async function replaceOpVersions(opIds, getTargetName, skipReason, action)
+{
+    const lines = [];
+    for (let i = 0; i < opIds.length; i++)
+    {
+        const o = CABLES.patch.getOpById(opIds[i]);
+        if (!o)
+        {
+            lines.push(opIds[i] + ": no op found with this id");
+            continue;
+        }
+
+        const targetName = getTargetName(o);
+        if (!targetName)
+        {
+            lines.push(opIds[i] + " " + o.objName + ": " + skipReason);
+            continue;
+        }
+
+        logMcp(action + " to " + targetName);
+        try
+        {
+            const result = await withTimeout(replaceOpVersion(o, targetName), REPLACE_OP_TIMEOUT_MS, "replace op");
+            let line = opIds[i] + " " + o.objName + " -> " + targetName + (result.newOp ? ", new id " + result.newOp.id : ", new op not found");
+            if (result.lostLinks.length) line += ", lost links of ports missing in the new version: " + result.lostLinks.join(", ");
+            lines.push(line);
+        }
+        catch (e)
+        {
+            lines.push(opIds[i] + " " + o.objName + ": could not replace: " + e.message);
+        }
+    }
+    return lines.join("\n");
+}
+
+// deletes all ops except this mcp server op and the ops linked to it
+function clearPatchKeepMcp()
+{
+    const keep = new Set([op.id]);
+    for (let i = 0; i < op.portsOut.length; i++)
+        for (let j = 0; j < op.portsOut[i].links.length; j++) keep.add(op.portsOut[i].links[j].getOtherPort(op.portsOut[i]).op.id);
+
+    const ids = [];
+    for (let i = 0; i < CABLES.patch.ops.length; i++)
+        if (!keep.has(CABLES.patch.ops[i].id)) ids.push(CABLES.patch.ops[i].id);
+
+    for (let i = 0; i < ids.length; i++) CABLES.patch.deleteOp(ids[i]);
+    return ids.length;
+}
+
+// patch coordinates right of all ops in the current subpatch, so pasted ops do not overlap
+function freePastePosition()
+{
+    const sub = gui.patchView.getCurrentSubPatch();
+    let maxX = null;
+    let minY = null;
+    for (let i = 0; i < CABLES.patch.ops.length; i++)
+    {
+        const o = CABLES.patch.ops[i];
+        if (!o.uiAttribs.translate || o.uiAttribs.subPatch != sub) continue;
+        maxX = maxX === null ? o.uiAttribs.translate.x : Math.max(maxX, o.uiAttribs.translate.x);
+        minY = minY === null ? o.uiAttribs.translate.y : Math.min(minY, o.uiAttribs.translate.y);
+    }
+    if (maxX === null) return { "x": 0, "y": 0 };
+    return { "x": maxX + PASTE_GAP_X, "y": minY };
 }
 
 // attachment file names always start with att_, e.g. att_inc_node.js
@@ -249,7 +516,11 @@ function executeOp(opname)
     return new Promise((resolve) =>
     {
         const timeout = setTimeout(resolve, 15000);
-        gui.serverOps.execute(opname, () => { clearTimeout(timeout); resolve(); });
+        gui.serverOps.execute(opname, () =>
+        {
+            clearTimeout(timeout);
+            resolve();
+        });
     });
 }
 
@@ -361,7 +632,8 @@ function setPortValueUndoable(opId, portName, value)
     apply(value);
 
     if (oldValue !== value)
-        CABLES.UI.undo.add({
+        CABLES.UI.undo.add(
+        {
             "title": "Value change " + portName,
             "context": { "portname": portName },
             "undo": () => { apply(oldValue); },
@@ -386,7 +658,8 @@ function setOpCommentUndoable(opId, comment)
     apply(comment);
 
     if (oldComment !== comment)
-        CABLES.UI.undo.add({
+        CABLES.UI.undo.add(
+        {
             "title": "Op comment",
             "undo": () => { apply(oldComment); },
             "redo": () => { apply(comment); }
@@ -464,7 +737,8 @@ function changePortAnimUndoable(opId, portName, title, change)
     applyPortAnimState(opId, portName, portAnimState(port));
 
     const newState = portAnimState(port);
-    CABLES.UI.undo.add({
+    CABLES.UI.undo.add(
+    {
         "title": title,
         "context": { "portname": portName },
         "undo": () => { applyPortAnimState(opId, portName, oldState); },
@@ -500,7 +774,8 @@ function addOpUndoable(objName, uiAttribs)
     {
         const timeout = setTimeout(() => { reject(new Error("timed out, no such op?")); }, 10000);
 
-        gui.patchView.addOp(objName, {
+        gui.patchView.addOp(objName,
+        {
             "uiAttribs": uiAttribs,
             "onOpAdd": (newOp) =>
             {
@@ -508,7 +783,8 @@ function addOpUndoable(objName, uiAttribs)
                 const opId = newOp.id;
                 const attribs = JSON.parse(JSON.stringify(newOp.uiAttribs));
 
-                CABLES.UI.undo.add({
+                CABLES.UI.undo.add(
+                {
                     "title": "Add op " + objName,
                     "undo": () => { CABLES.patch.deleteOp(opId); },
                     "redo": () => { CABLES.patch.addOp(objName, attribs, opId); }
@@ -561,7 +837,11 @@ function grabPatchFieldScreenshot(maxSize)
     return new Promise((resolve, reject) =>
     {
         const cgl = gui.patchView.patchRenderer.cgl;
-        const timeout = setTimeout(() => { cgl.off(listener); reject(new Error("patch field did not render a frame")); }, PATCHFIELD_FRAME_TIMEOUT_MS);
+        const timeout = setTimeout(() =>
+        {
+            cgl.off(listener);
+            reject(new Error("patch field did not render a frame"));
+        }, PATCHFIELD_FRAME_TIMEOUT_MS);
 
         const listener = cgl.on("endFrame", () =>
         {
@@ -585,7 +865,11 @@ function grabTimelineScreenshot(maxSize)
         if (!glTimeline) { reject(new Error("timeline is not open, run the command \"Show timeline\" first")); return; }
 
         const cgl = glTimeline.cgl;
-        const timeout = setTimeout(() => { cgl.off(listener); reject(new Error("timeline did not render a frame")); }, PATCHFIELD_FRAME_TIMEOUT_MS);
+        const timeout = setTimeout(() =>
+        {
+            cgl.off(listener);
+            reject(new Error("timeline did not render a frame"));
+        }, PATCHFIELD_FRAME_TIMEOUT_MS);
 
         const listener = cgl.on("endFrame", () =>
         {
@@ -705,7 +989,7 @@ function layerOps(ops, set, sideChains)
         {
             pullDownToChildren(ops, set, layer, sideChains);
             const layers = [];
-            for (const o of ops) (layers[layer.get(o)] = layers[layer.get(o)] || []).push(o);
+            for (const o of ops)(layers[layer.get(o)] = layers[layer.get(o)] || []).push(o);
             return layers.filter(Boolean);
         }
     }
@@ -974,7 +1258,8 @@ function childX(o, set, pos, fanSlots)
 function childrenByPort(op, set)
 {
     const seen = new Set();
-    return op.portsOut.map((portOut) => ({
+    return op.portsOut.map((portOut) => (
+    {
         "portOut": portOut,
         "children": portOut.links.map((l) => l.portIn.op).filter((c) =>
         {
@@ -1043,8 +1328,10 @@ function extentWidth(ext)
 function subtreeSize(o, set, sideChains)
 {
     let size = 1;
-    for (const sideChain of sideChains.values()) if (sideChain.anchor == o) size += sideChain.chain.length;
-    for (const { children } of childrenByPort(o, set)) for (const c of children) size += subtreeSize(c, set, sideChains);
+    for (const sideChain of sideChains.values())
+        if (sideChain.anchor == o) size += sideChain.chain.length;
+    for (const { children } of childrenByPort(o, set))
+        for (const c of children) size += subtreeSize(c, set, sideChains);
     return size;
 }
 
@@ -1493,8 +1780,7 @@ function buildMcpServer()
     // real MCP resources, for clients that browse/read via resources/list + resources/read
     server.registerResource(
         "open-tab",
-        new McpServer.ResourceTemplate("mcpfile:///{name}", { "list": () => ({ "resources": listOpenTabResources() }) }),
-        { "description": "a file currently opened in the cables code editor" },
+        new McpServer.ResourceTemplate("mcpfile:///{name}", { "list": () => ({ "resources": listOpenTabResources() }) }), { "description": "a file currently opened in the cables code editor" },
         async (uri) =>
         {
             logMcp("read file " + uriLabel(uri.href));
@@ -1505,8 +1791,7 @@ function buildMcpServer()
 
     server.registerResource(
         "patch json",
-        new McpServer.ResourceTemplate("cables://patch.json", { "list": undefined }),
-        { "description": "read-only structure and data of the current patch" },
+        new McpServer.ResourceTemplate("cables://patch.json", { "list": undefined }), { "description": "read-only structure and data of the current patch" },
         async (uri) =>
         {
             logMcp("read patch.json");
@@ -1517,8 +1802,7 @@ function buildMcpServer()
 
     server.registerResource(
         "op-source",
-        new McpServer.ResourceTemplate("cables://op/{opname}", { "list": undefined }),
-        { "description": "read-only source code of a cables op; get op names from search-ops" },
+        new McpServer.ResourceTemplate("cables://op/{opname}", { "list": undefined }), { "description": "read-only source code of a cables op; get op names from search-ops" },
         async (uri) =>
         {
             logMcp("read op source " + uriLabel(uri.href));
@@ -1529,8 +1813,7 @@ function buildMcpServer()
 
     server.registerResource(
         "op-docs",
-        new McpServer.ResourceTemplate("cables://opdoc/{objName}", { "list": undefined }),
-        { "description": "documentation of a cables op as json (summary, description, port docs, ports layout); get op names from search-ops or list-op-docs" },
+        new McpServer.ResourceTemplate("cables://opdoc/{objName}", { "list": undefined }), { "description": "documentation of a cables op as json (summary, description, port docs, ports layout); get op names from search-ops or list-op-docs" },
         async (uri) =>
         {
             logMcp("read op docs " + uriLabel(uri.href));
@@ -1544,8 +1827,7 @@ function buildMcpServer()
     // can still browse and read them without relying on client-side resource support
     server.tool(
         "list-resources",
-        "list readable resources: files currently opened in the cables editor",
-        { },
+        "list readable resources: files currently opened in the cables editor", {},
         () =>
         {
             logMcp("list open files");
@@ -1555,8 +1837,7 @@ function buildMcpServer()
 
     server.tool(
         "read-resource",
-        "read a resource by uri (mcpfile:///<name>, cables://op/<opname>, cables://opdoc/<opname>, or cables://patch.json)",
-        { "uri": z.string() },
+        "read a resource by uri (mcpfile:///<name>, cables://op/<opname>, cables://opdoc/<opname>, or cables://patch.json)", { "uri": z.string() },
         async ({ uri }) =>
         {
             logMcp("read " + uriLabel(uri));
@@ -1567,8 +1848,7 @@ function buildMcpServer()
 
     server.tool(
         "read-op",
-        "read the code of an op (or one of its attachments, att_ prefix optional) with line numbers, much cheaper than reading the whole file: fromLine/toLine limit it to a range of lines, find only lists the lines containing that text. use edit-op-text to change it.",
-        { "opname": z.string(), "attachment": z.string().optional(), "fromLine": z.number().optional(), "toLine": z.number().optional(), "find": z.string().optional() },
+        "read the code of an op (or one of its attachments, att_ prefix optional) with line numbers, much cheaper than reading the whole file: fromLine/toLine limit it to a range of lines, find only lists the lines containing that text. use edit-op-text to change it.", { "opname": z.string(), "attachment": z.string().optional(), "fromLine": z.number().optional(), "toLine": z.number().optional(), "find": z.string().optional() },
         async ({ opname, attachment, fromLine, toLine, find }) =>
         {
             logMcp("read op " + opname + (attachment ? "/" + attachmentFileName(attachment) : ""));
@@ -1596,8 +1876,7 @@ function buildMcpServer()
 
     server.tool(
         "edit-op-text",
-        "change the code of an op (or one of its attachments, att_ prefix optional) by replacing oldText with newText, without sending the whole file. oldText has to match exactly once (copy it from read-op without the line numbers, include enough surrounding lines to make it unique), or pass replaceAll=true to replace every occurrence. the op is saved and re-executed afterwards.",
-        { "opname": z.string(), "attachment": z.string().optional(), "oldText": z.string(), "newText": z.string(), "replaceAll": z.boolean().optional() },
+        "change the code of an op (or one of its attachments, att_ prefix optional) by replacing oldText with newText, without sending the whole file. oldText has to match exactly once (copy it from read-op without the line numbers, include enough surrounding lines to make it unique), or pass replaceAll=true to replace every occurrence. the op is saved and re-executed afterwards.", { "opname": z.string(), "attachment": z.string().optional(), "oldText": z.string(), "newText": z.string(), "replaceAll": z.boolean().optional() },
         async ({ opname, attachment, oldText, newText, replaceAll }) =>
         {
             logMcp("edit op " + opname + (attachment ? "/" + attachmentFileName(attachment) : ""));
@@ -1622,8 +1901,7 @@ function buildMcpServer()
 
     server.tool(
         "edit-op",
-        "open an op to edit and change it",
-        { "opname": z.string() },
+        "open an op to edit and change it", { "opname": z.string() },
         (opts) =>
         {
             logMcp("edit op " + opts.opname);
@@ -1634,8 +1912,7 @@ function buildMcpServer()
 
     server.tool(
         "search-ops",
-        "search through all available ops, best matches first, one per line as \"name: summary\". limit is the number of results (default " + SEARCH_DEFAULT_LIMIT + ", 0 = all). use get-op-docs for ports and docs, read-op for the source.",
-        { "str": z.string(), "limit": z.number().optional() },
+        "search through all available ops, best matches first, one per line as \"name: summary\". limit is the number of results (default " + SEARCH_DEFAULT_LIMIT + ", 0 = all). use get-op-docs for ports and docs, read-op for the source.", { "str": z.string(), "limit": z.number().optional() },
         ({ str, limit }) =>
         {
             logMcp("search ops \"" + str + "\"");
@@ -1653,8 +1930,7 @@ function buildMcpServer()
 
     server.tool(
         "write-opened-resources",
-        "change/write content of an opened file",
-        { "uri": z.string(), "text": z.string() },
+        "change/write content of an opened file", { "uri": z.string(), "text": z.string() },
         ({ uri, text }) =>
         {
             logMcp("write file " + uriLabel(uri));
@@ -1671,8 +1947,7 @@ function buildMcpServer()
 
     server.tool(
         "create-op",
-        "create a new op by its full name (e.g. Ops.Extension.ShaderGraph.Sdf.Sphere, the name decides where it is stored), optionally with its code and attachments as { \"att_name\": content } (att_ prefix optional). add it to the patch with add-op afterwards.",
-        { "opname": z.string(), "code": z.string().optional(), "attachments": z.record(z.string()).optional() },
+        "create a new op by its full name (e.g. Ops.Extension.ShaderGraph.Sdf.Sphere, the name decides where it is stored), optionally with its code and attachments as { \"att_name\": content } (att_ prefix optional). add it to the patch with add-op afterwards.", { "opname": z.string(), "code": z.string().optional(), "attachments": z.record(z.string()).optional() },
         async ({ opname, code, attachments }) =>
         {
             logMcp("create op " + opname);
@@ -1693,8 +1968,7 @@ function buildMcpServer()
 
     server.tool(
         "list-op-attachments",
-        "list the attachment files of an op (e.g. att_inc_node.js, att_shader.vert), by full op name. read them with read-op-attachment, change them with write-op-attachment.",
-        { "opname": z.string() },
+        "list the attachment files of an op (e.g. att_inc_node.js, att_shader.vert), by full op name. read them with read-op-attachment, change them with write-op-attachment.", { "opname": z.string() },
         ({ opname }) =>
         {
             logMcp("list attachments " + opname);
@@ -1709,8 +1983,7 @@ function buildMcpServer()
 
     server.tool(
         "read-op-attachment",
-        "read the content of an op attachment file by full op name and attachment name (e.g. att_inc_node.js, the att_ prefix is optional); see list-op-attachments",
-        { "opname": z.string(), "name": z.string() },
+        "read the content of an op attachment file by full op name and attachment name (e.g. att_inc_node.js, the att_ prefix is optional); see list-op-attachments", { "opname": z.string(), "name": z.string() },
         async ({ opname, name }) =>
         {
             logMcp("read attachment " + opname + "/" + attachmentFileName(name));
@@ -1728,8 +2001,7 @@ function buildMcpServer()
 
     server.tool(
         "write-op-attachment",
-        "write the full content of an op attachment file (the att_ prefix is optional), creating it if the op does not have it yet. att_inc_*.js files are included into the op code, other attachments are available in the op as attachments.<name> (dots replaced by _). by default the op is re-executed afterwards so all instances in the patch use the new code; pass execute=false when writing several attachments and only execute on the last one.",
-        { "opname": z.string(), "name": z.string(), "content": z.string(), "execute": z.boolean().optional() },
+        "write the full content of an op attachment file (the att_ prefix is optional), creating it if the op does not have it yet. att_inc_*.js files are included into the op code, other attachments are available in the op as attachments.<name> (dots replaced by _). by default the op is re-executed afterwards so all instances in the patch use the new code; pass execute=false when writing several attachments and only execute on the last one.", { "opname": z.string(), "name": z.string(), "content": z.string(), "execute": z.boolean().optional() },
         async ({ opname, name, content, execute }) =>
         {
             logMcp("write attachment " + opname + "/" + attachmentFileName(name));
@@ -1750,8 +2022,7 @@ function buildMcpServer()
 
     server.tool(
         "upload-file",
-        "upload a file into the patch's asset folder, either downloaded by the editor from a url (the server must allow cors) or from base64 content. returns the path to use in file ports, e.g. the File port of Ops.Gl.Texture_v3.",
-        { "filename": z.string(), "url": z.string().optional(), "base64": z.string().optional() },
+        "upload a file into the patch's asset folder, either downloaded by the editor from a url (the server must allow cors) or from base64 content. returns the path to use in file ports, e.g. the File port of Ops.Gl.Texture_v3.", { "filename": z.string(), "url": z.string().optional(), "base64": z.string().optional() },
         async ({ filename, url, base64 }) =>
         {
             logMcp("upload file " + filename);
@@ -1775,10 +2046,79 @@ function buildMcpServer()
         }
     );
 
+    const loadPatchParams = { "clear": z.boolean().optional(), "x": z.number().optional(), "y": z.number().optional(), "server": z.string().optional(), "assetServer": z.string().optional() };
+    const loadPatchDescription = "file ports pointing at /assets/... (project and library files) are rewritten to load from https://devsandbox.cables.gl/assets/... (assetServer changes that url). clear=true deletes all ops first, except the mcp server op and the ops linked to it. x/y place the ops, by default right of the existing ops. undoable. ops that are not available locally (e.g. user or patch ops) are left out and reported.";
+
+    server.tool(
+        "load-patch-json",
+        "download a public patch from the live cables server and add its ops to the current subpatch, like pasting them. project is the patch id, short id or url (https://cables.gl/p/<id>). " + loadPatchDescription, { "project": z.string(), ...loadPatchParams },
+        async (params) =>
+        {
+            const patchId = parsePatchId(params.project);
+            logMcp("load patch json " + patchId);
+            return loadPatchJson(patchId, params, "");
+        }
+    );
+
+    server.tool(
+        "load-example-patch",
+        "load the example patch of an op by its full op name (e.g. Ops.Gl.Texture_v3) from the live cables server and add its ops to the current subpatch, like pasting them. if the op has no example patch, the example of its newest older version that has one is used. " + loadPatchDescription, { "opname": z.string(), ...loadPatchParams },
+        async (params) =>
+        {
+            logMcp("example " + params.opname);
+
+            const opDoc = gui.opDocs.getOpDocByName(params.opname);
+            if (!opDoc) return respondError("no op found with name " + params.opname);
+
+            const example = findExamplePatch(opDoc);
+            if (!example) return respondError(params.opname + " and its older versions have no example patch");
+
+            let note = "example patch of " + example.opName;
+            if (example.opName != params.opname) note += ", " + params.opname + " has no example patch of its own";
+            return loadPatchJson(example.patchId, params, note);
+        }
+    );
+
+    server.tool(
+        "upgrade-ops",
+        "replace ops with the newest version of their op, the same as the editor's \"Upgrade selected ops\" command: port values, links and position are copied, the op gets a new id. opIds are op ids in the current patch, all=true upgrades every outdated op in the patch instead. ops that are already the newest version are skipped. reports links that are lost because the new version does not have that port.", { "opIds": z.array(z.string()).optional(), "all": z.boolean().optional() },
+        async ({ opIds, all }) =>
+        {
+            let ids = opIds || [];
+            if (all)
+            {
+                ids = [];
+                for (let i = 0; i < CABLES.patch.ops.length; i++)
+                    if (getNewestVersionName(CABLES.patch.ops[i])) ids.push(CABLES.patch.ops[i].id);
+            }
+            if (!ids.length) return respondText(all ? "no outdated ops in the patch" : "pass opIds or all=true");
+
+            return respondText(await replaceOpVersions(ids, getNewestVersionName, "already the newest version", "upgrade"));
+        }
+    );
+
+    server.tool(
+        "downgrade-ops",
+        "replace ops with the previous version of their op (e.g. Ops.Gl.Texture_v3 -> Ops.Gl.Texture_v2), the same as the editor's \"Downgrade selected op\" command: port values, links and position are copied, the op gets a new id. ops without a previous version are skipped. reports links that are lost because the old version does not have that port.", { "opIds": z.array(z.string()) },
+        async ({ opIds }) =>
+        {
+            return respondText(await replaceOpVersions(opIds, getPreviousVersionName, "has no previous version", "downgrade"));
+        }
+    );
+
+    server.tool(
+        "clear-patch",
+        "delete all ops of the patch (in all subpatches) except this mcp server op and the ops linked to it, e.g. its logger. returns the number of deleted ops.", {},
+        () =>
+        {
+            logMcp("clear patch");
+            return respondText("deleted " + clearPatchKeepMcp() + " ops");
+        }
+    );
+
     server.tool(
         "set-port-value",
-        "set the value of a port on an op in the current patch; identify the op by its id and the port by its name (see get-patch / cables://patch.json for op ids and port names)",
-        { "opId": z.string(), "portName": z.string(), "value": z.any() },
+        "set the value of a port on an op in the current patch; identify the op by its id and the port by its name (see get-patch / cables://patch.json for op ids and port names)", { "opId": z.string(), "portName": z.string(), "value": z.any() },
         ({ opId, portName, value }) =>
         {
             logMcp("set " + opLabel(opId) + "." + portName + " = " + String(JSON.stringify(value)).substring(0, 60));
@@ -1797,8 +2137,7 @@ function buildMcpServer()
 
     server.tool(
         "timeline",
-        "control the timeline: play (true plays, false pauses) and time (jump to a time in seconds). viewStart/viewLength scroll/zoom the timeline panel so it shows viewLength seconds starting at viewStart (animated, the reported view is from before the change). without arguments it only reports the current time, whether it is playing and, if the timeline panel is open, its view. animated ports and Ops.TimeLine.* ops follow this time.",
-        { "play": z.boolean().optional(), "time": z.number().optional(), "viewStart": z.number().optional(), "viewLength": z.number().optional() },
+        "control the timeline: play (true plays, false pauses) and time (jump to a time in seconds). viewStart/viewLength scroll/zoom the timeline panel so it shows viewLength seconds starting at viewStart (animated, the reported view is from before the change). without arguments it only reports the current time, whether it is playing and, if the timeline panel is open, its view. animated ports and Ops.TimeLine.* ops follow this time.", { "play": z.boolean().optional(), "time": z.number().optional(), "viewStart": z.number().optional(), "viewLength": z.number().optional() },
         ({ play, time, viewStart, viewLength }) =>
         {
             const timer = CABLES.patch.timer;
@@ -1824,8 +2163,7 @@ function buildMcpServer()
 
     server.tool(
         "set-port-animated",
-        "make a number input port animated (keyframed by the timeline) or not animated anymore. a newly animated port gets a first keyframe with its current value at the current timeline time. undoable. the same way Ops.TimeLine.Anim has an animated \"Value\" port whose anim can be reused by linking its \"Anim\" output to several Ops.TimeLine.AnimGetValue ops.",
-        { "opId": z.string(), "portName": z.string(), "animated": z.boolean() },
+        "make a number input port animated (keyframed by the timeline) or not animated anymore. a newly animated port gets a first keyframe with its current value at the current timeline time. undoable. the same way Ops.TimeLine.Anim has an animated \"Value\" port whose anim can be reused by linking its \"Anim\" output to several Ops.TimeLine.AnimGetValue ops.", { "opId": z.string(), "portName": z.string(), "animated": z.boolean() },
         ({ opId, portName, animated }) =>
         {
             logMcp((animated ? "animate " : "unanimate ") + opLabel(opId) + "." + portName);
@@ -1842,8 +2180,7 @@ function buildMcpServer()
 
     server.tool(
         "get-anim",
-        "get the animation of a port: whether it is animated, its keyframes (time in seconds, value, easing), loop mode, length (time of the last keyframe), the current timeline time and the value at that time.",
-        { "opId": z.string(), "portName": z.string() },
+        "get the animation of a port: whether it is animated, its keyframes (time in seconds, value, easing), loop mode, length (time of the last keyframe), the current timeline time and the value at that time.", { "opId": z.string(), "portName": z.string() },
         ({ opId, portName }) =>
         {
             logMcp("get anim " + opLabel(opId) + "." + portName);
@@ -1897,8 +2234,7 @@ function buildMcpServer()
 
     server.tool(
         "delete-keyframes",
-        "delete keyframes of an animated port by their times in seconds (see get-anim). an animation needs at least one key, to remove the whole animation use set-port-animated with animated=false. undoable as one step.",
-        { "opId": z.string(), "portName": z.string(), "times": z.array(z.number()) },
+        "delete keyframes of an animated port by their times in seconds (see get-anim). an animation needs at least one key, to remove the whole animation use set-port-animated with animated=false. undoable as one step.", { "opId": z.string(), "portName": z.string(), "times": z.array(z.number()) },
         ({ opId, portName, times }) =>
         {
             logMcp("delete " + times.length + " keyframes " + opLabel(opId) + "." + portName);
@@ -1931,8 +2267,7 @@ function buildMcpServer()
 
     server.tool(
         "trigger-port",
-        "trigger/execute a trigger-type port on an op directly, without needing anything connected to it; identify the op by its id and the port by its name (see cables://patch.json for op ids and port names). fails if the port is not a trigger port.",
-        { "opId": z.string(), "portName": z.string() },
+        "trigger/execute a trigger-type port on an op directly, without needing anything connected to it; identify the op by its id and the port by its name (see cables://patch.json for op ids and port names). fails if the port is not a trigger port.", { "opId": z.string(), "portName": z.string() },
         ({ opId, portName }) =>
         {
             logMcp("trigger " + opLabel(opId) + "." + portName);
@@ -1951,15 +2286,13 @@ function buildMcpServer()
             // op's onTriggered handler directly, regardless of whether anything is linked.
             port._onTriggered();
 
-
             return respondText("triggered " + opId + "." + portName);
         }
     );
 
     server.tool(
         "link-ports",
-        "connect (link) an output port of one op to an input port of another op in the current patch; identify ops by id and ports by name (see cables://patch.json for op ids and port names)",
-        { "opId1": z.string(), "portName1": z.string(), "opId2": z.string(), "portName2": z.string() },
+        "connect (link) an output port of one op to an input port of another op in the current patch; identify ops by id and ports by name (see cables://patch.json for op ids and port names)", { "opId1": z.string(), "portName1": z.string(), "opId2": z.string(), "portName2": z.string() },
         ({ opId1, portName1, opId2, portName2 }) =>
         {
             logMcp("link " + opLabel(opId1) + "." + portName1 + " -> " + opLabel(opId2) + "." + portName2);
@@ -1983,8 +2316,7 @@ function buildMcpServer()
 
     server.tool(
         "unlink-ports",
-        "remove an existing link between two ports (the inverse of link-ports); identify ops by id and ports by name. fails if no such link exists.",
-        { "opId1": z.string(), "portName1": z.string(), "opId2": z.string(), "portName2": z.string() },
+        "remove an existing link between two ports (the inverse of link-ports); identify ops by id and ports by name. fails if no such link exists.", { "opId1": z.string(), "portName1": z.string(), "opId2": z.string(), "portName2": z.string() },
         ({ opId1, portName1, opId2, portName2 }) =>
         {
             logMcp("unlink " + opLabel(opId1) + "." + portName1 + " -> " + opLabel(opId2) + "." + portName2);
@@ -2008,8 +2340,7 @@ function buildMcpServer()
 
     server.tool(
         "move-op",
-        "reposition an existing op in the patch editor view (does not affect rendering, purely cosmetic layout); identify the op by its id and give its new x/y editor coordinates",
-        { "opId": z.string(), "x": z.number(), "y": z.number() },
+        "reposition an existing op in the patch editor view (does not affect rendering, purely cosmetic layout); identify the op by its id and give its new x/y editor coordinates", { "opId": z.string(), "x": z.number(), "y": z.number() },
         ({ opId, x, y }) =>
         {
             logMcp("move " + opLabel(opId) + " to " + x + "," + y);
@@ -2018,11 +2349,13 @@ function buildMcpServer()
             if (!targetOp) return respondError("no op found with id " + opId);
 
             const old = targetOp.uiAttribs.translate || { "x": 0, "y": 0 };
-            const oldX = old.x, oldY = old.y;
+            const oldX = old.x,
+                oldY = old.y;
             const moveTo = (px, py) => { gui.patchView.patchRenderer.patchAPI.setOpUiAttribs(opId, "translate", { "x": px, "y": py }); };
 
             moveTo(x, y);
-            CABLES.UI.undo.add({
+            CABLES.UI.undo.add(
+            {
                 "title": "Move op",
                 "undo": () => { moveTo(oldX, oldY); },
                 "redo": () => { moveTo(x, y); }
@@ -2034,8 +2367,7 @@ function buildMcpServer()
 
     server.tool(
         "patch-view",
-        "scroll/zoom the patch field (the editor's op graph, not the rendering canvas). fit=true zooms to show all ops of the current subpatch, opIds fits the view to those ops, x/y center the view on a patch coordinate (the same coordinates as op positions), zoom is half the visible width in patch units (bigger = further out). without arguments it only reports the current view. returns the visible area in patch coordinates. take a look with patch-field-screenshot.",
-        { "fit": z.boolean().optional(), "opIds": z.array(z.string()).optional(), "x": z.number().optional(), "y": z.number().optional(), "zoom": z.number().optional() },
+        "scroll/zoom the patch field (the editor's op graph, not the rendering canvas). fit=true zooms to show all ops of the current subpatch, opIds fits the view to those ops, x/y center the view on a patch coordinate (the same coordinates as op positions), zoom is half the visible width in patch units (bigger = further out). without arguments it only reports the current view. returns the visible area in patch coordinates. take a look with patch-field-screenshot.", { "fit": z.boolean().optional(), "opIds": z.array(z.string()).optional(), "x": z.number().optional(), "y": z.number().optional(), "zoom": z.number().optional() },
         async ({ fit, opIds, x, y, zoom }) =>
         {
             logMcp("patch view");
@@ -2064,8 +2396,7 @@ function buildMcpServer()
 
     server.tool(
         "patch-field-screenshot",
-        "take a screenshot of the patch field (the editor's op graph with ops and links, not the rendering canvas) as a png image. maxSize limits the longer edge in pixels (default " + SCREENSHOT_DEFAULT_MAX_SIZE + ", 0 = original size). use patch-view to scroll/zoom first; panels on top of the patch field are not in the image.",
-        { "maxSize": z.number().optional() },
+        "take a screenshot of the patch field (the editor's op graph with ops and links, not the rendering canvas) as a png image. maxSize limits the longer edge in pixels (default " + SCREENSHOT_DEFAULT_MAX_SIZE + ", 0 = original size). use patch-view to scroll/zoom first; panels on top of the patch field are not in the image.", { "maxSize": z.number().optional() },
         async ({ maxSize }) =>
         {
             logMcp("patch field screenshot");
@@ -2084,8 +2415,7 @@ function buildMcpServer()
 
     server.tool(
         "perf-profiler-read",
-        "read the patch's perf profiler (the per-frame durations and counts the code reports with perfProfiler.setDuration/addCount, e.g. \"timeline cpu\" or \"<canvas> gpu\" from gl timer queries): per name the average, max and last value over the kept frames (default 120). optional filter only lists names containing that text.",
-        { "filter": z.string().optional() },
+        "read the patch's perf profiler (the per-frame durations and counts the code reports with perfProfiler.setDuration/addCount, e.g. \"timeline cpu\" or \"<canvas> gpu\" from gl timer queries): per name the average, max and last value over the kept frames (default 120). optional filter only lists names containing that text.", { "filter": z.string().optional() },
         ({ filter }) =>
         {
             logMcp("perf profiler read");
@@ -2111,8 +2441,7 @@ function buildMcpServer()
 
     server.tool(
         "timeline-screenshot",
-        "take a screenshot of the timeline panel (ruler, overview, keys and curves) as a png image. only the gl canvas: the html line titles and buttons are not in the image. maxSize limits the longer edge in pixels (default " + SCREENSHOT_DEFAULT_MAX_SIZE + ", 0 = original size). the timeline has to be open (command \"Show timeline\").",
-        { "maxSize": z.number().optional() },
+        "take a screenshot of the timeline panel (ruler, overview, keys and curves) as a png image. only the gl canvas: the html line titles and buttons are not in the image. maxSize limits the longer edge in pixels (default " + SCREENSHOT_DEFAULT_MAX_SIZE + ", 0 = original size). the timeline has to be open (command \"Show timeline\").", { "maxSize": z.number().optional() },
         async ({ maxSize }) =>
         {
             logMcp("timeline screenshot");
@@ -2131,8 +2460,7 @@ function buildMcpServer()
 
     server.tool(
         "tidy-up-ops",
-        "tidy up the layout of ops: arranges them in rows following their links (every op below all ops linked to its inputs), each op at the x of the op above until the links split, split children side by side in port order. ops never overlap. unselected ops are never moved, the selected ops are placed around them. links may cross. snapped to the grid. works on the selected ops, or on opIds; all have to be in the current subpatch. undoable as one step. if no valid layout is found (link cycle, no free place) nothing is changed and the reason is returned.",
-        { "opIds": z.array(z.string()).optional(), "dryRun": z.boolean().optional() },
+        "tidy up the layout of ops: arranges them in rows following their links (every op below all ops linked to its inputs), each op at the x of the op above until the links split, split children side by side in port order. ops never overlap. unselected ops are never moved, the selected ops are placed around them. links may cross. snapped to the grid. works on the selected ops, or on opIds; all have to be in the current subpatch. undoable as one step. if no valid layout is found (link cycle, no free place) nothing is changed and the reason is returned.", { "opIds": z.array(z.string()).optional(), "dryRun": z.boolean().optional() },
         ({ opIds, dryRun }) =>
         {
             logMcp("tidy up ops");
@@ -2163,8 +2491,7 @@ function buildMcpServer()
 
     server.tool(
         "debug-glop",
-        "temporary: debug info of an op's glop (size, area size)",
-        { "opId": z.string() },
+        "temporary: debug info of an op's glop (size, area size)", { "opId": z.string() },
         ({ opId }) =>
         {
             if (opId == "scripts")
@@ -2192,7 +2519,8 @@ function buildMcpServer()
             if (!o) return respondError("no op " + opId);
             const g = gui.patchView.patchRenderer.getGlOp(o);
             const ra = g ? (g.resizableArea || g._resizableArea) : null;
-            return respondText(JSON.stringify({
+            return respondText(JSON.stringify(
+            {
                 "translate": o.uiAttribs.translate,
                 "hasArea": o.uiAttribs.hasArea,
                 "area": o.uiAttribs.area,
@@ -2205,8 +2533,7 @@ function buildMcpServer()
 
     server.tool(
         "set-op-comment",
-        "set the comment of an op in the patch by its id, shown next to its title in the patch editor (the same as the comment field in the param panel). an empty comment removes it. undoable.",
-        { "opId": z.string(), "comment": z.string() },
+        "set the comment of an op in the patch by its id, shown next to its title in the patch editor (the same as the comment field in the param panel). an empty comment removes it. undoable.", { "opId": z.string(), "comment": z.string() },
         ({ opId, comment }) =>
         {
             logMcp("comment " + opLabel(opId));
@@ -2220,8 +2547,7 @@ function buildMcpServer()
 
     server.tool(
         "focus-op",
-        "scroll/zoom the patch editor view to center on an op and open its param panel, so the person looking at the editor can see it. does not affect rendering.",
-        { "opId": z.string() },
+        "scroll/zoom the patch editor view to center on an op and open its param panel, so the person looking at the editor can see it. does not affect rendering.", { "opId": z.string() },
         ({ opId }) =>
         {
             logMcp("focus " + opLabel(opId));
@@ -2239,8 +2565,7 @@ function buildMcpServer()
 
     server.tool(
         "get-patch-overview",
-        "compact overview of the current patch, much smaller than cables://patch.json: one line per op with its id, full op name (objName), title and subpatch, followed by its incoming (<-) and outgoing (->) links as port: opId.port. no port values unless values=true, then only the values that differ from the op's defaults (linked ports left out). optional subPatch limits it to one subpatch, filter to ops whose name or title contains the text. use get-patch-op for all values of a single op.",
-        { "subPatch": z.string().optional(), "filter": z.string().optional(), "values": z.boolean().optional() },
+        "compact overview of the current patch, much smaller than cables://patch.json: one line per op with its id, full op name (objName), title and subpatch, followed by its incoming (<-) and outgoing (->) links as port: opId.port. no port values unless values=true, then only the values that differ from the op's defaults (linked ports left out). optional subPatch limits it to one subpatch, filter to ops whose name or title contains the text. use get-patch-op for all values of a single op.", { "subPatch": z.string().optional(), "filter": z.string().optional(), "values": z.boolean().optional() },
         ({ subPatch, filter, values }) =>
         {
             logMcp("patch overview" + (filter ? " \"" + filter + "\"" : ""));
@@ -2252,8 +2577,7 @@ function buildMcpServer()
 
     server.tool(
         "select-op",
-        "select ops in the patch editor, like clicking them. commands from run-command act on the selected ops. opIds is a list of op ids, add true keeps the current selection, otherwise it is cleared first.",
-        { "opIds": z.array(z.string()), "add": z.boolean().optional() },
+        "select ops in the patch editor, like clicking them. commands from run-command act on the selected ops. opIds is a list of op ids, add true keeps the current selection, otherwise it is cleared first.", { "opIds": z.array(z.string()), "add": z.boolean().optional() },
         ({ opIds, add }) =>
         {
             logMcp("select " + opIds.map((opId) => { return opLabel(opId); }).join(", "));
@@ -2273,8 +2597,7 @@ function buildMcpServer()
 
     server.tool(
         "add-op",
-        "add a new op to the current patch by its full op name (objName), e.g. Ops.Anim.Timer_v2; get valid names from search-ops. returns the new op's id (use it with link-ports / set-port-value) and its port names. optional x/y place it in the patch editor view.",
-        { "objName": z.string(), "x": z.number().optional(), "y": z.number().optional() },
+        "add a new op to the current patch by its full op name (objName), e.g. Ops.Anim.Timer_v2; get valid names from search-ops. returns the new op's id (use it with link-ports / set-port-value) and its port names. optional x/y place it in the patch editor view.", { "objName": z.string(), "x": z.number().optional(), "y": z.number().optional() },
         async ({ objName, x, y }) =>
         {
             logMcp("add op " + objName);
@@ -2303,8 +2626,7 @@ function buildMcpServer()
 
     server.tool(
         "delete-op",
-        "delete an op from the current patch by its id (see cables://patch.json for op ids); this also removes any links connected to it",
-        { "opId": z.string() },
+        "delete an op from the current patch by its id (see cables://patch.json for op ids); this also removes any links connected to it", { "opId": z.string() },
         ({ opId }) =>
         {
             logMcp("delete " + opLabel(opId));
@@ -2324,8 +2646,7 @@ function buildMcpServer()
 
     server.tool(
         "get-patch-errors",
-        "check the current patch for errors: lists ops that show ui errors/warnings (e.g. shader compile errors, missing links, wrong input types) with their messages, plus code diagnostics (line, message, code) where available. minLevel filters by severity: 0 hint, 1 warning, 2 error (default 1). optional opId checks a single op. use it after changing shader code or port values.",
-        { "minLevel": z.number().optional(), "opId": z.string().optional() },
+        "check the current patch for errors: lists ops that show ui errors/warnings (e.g. shader compile errors, missing links, wrong input types) with their messages, plus code diagnostics (line, message, code) where available. minLevel filters by severity: 0 hint, 1 warning, 2 error (default 1). optional opId checks a single op. use it after changing shader code or port values.", { "minLevel": z.number().optional(), "opId": z.string().optional() },
         async ({ minLevel, opId }) =>
         {
             logMcp("check patch errors" + (opId ? " of " + opLabel(opId) : ""));
@@ -2342,8 +2663,7 @@ function buildMcpServer()
 
     server.tool(
         "save-patch",
-        "save the current patch to disk/server, the same as the editor's own save action (ctrl+s). skips confirmation dialogs since there is no user to click through them.",
-        { },
+        "save the current patch to disk/server, the same as the editor's own save action (ctrl+s). skips confirmation dialogs since there is no user to click through them.", {},
         async () =>
         {
             logMcp("save patch");
@@ -2362,8 +2682,7 @@ function buildMcpServer()
 
     server.tool(
         "set-patch-name",
-        "rename the current patch (its title), the same as the editor's patch title dialog. the new name is stored right away, no save-patch needed.",
-        { "name": z.string() },
+        "rename the current patch (its title), the same as the editor's patch title dialog. the new name is stored right away, no save-patch needed.", { "name": z.string() },
         async ({ name }) =>
         {
             logMcp("set patch name \"" + name + "\"");
@@ -2384,8 +2703,7 @@ function buildMcpServer()
 
     server.tool(
         "get-console-logs",
-        "read the editor's console: console.log/warn/error, uncaught exceptions and browser messages like the yellow webgl warnings (GL_INVALID_OPERATION...). needs electron started with --remote-debugging-port=9222. minLevel: verbose, info, warning or error (default info). optional str filters by text, limit is the number of newest entries (default 100), clear empties the list afterwards.",
-        { "minLevel": z.enum(CONSOLE_LEVELS).optional(), "str": z.string().optional(), "limit": z.number().optional(), "clear": z.boolean().optional() },
+        "read the editor's console: console.log/warn/error, uncaught exceptions and browser messages like the yellow webgl warnings (GL_INVALID_OPERATION...). needs electron started with --remote-debugging-port=9222. minLevel: verbose, info, warning or error (default info). optional str filters by text, limit is the number of newest entries (default 100), clear empties the list afterwards.", { "minLevel": z.enum(CONSOLE_LEVELS).optional(), "str": z.string().optional(), "limit": z.number().optional(), "clear": z.boolean().optional() },
         async ({ minLevel, str, limit, clear }) =>
         {
             logMcp("get console logs" + (str ? " \"" + str + "\"" : ""));
@@ -2416,8 +2734,7 @@ function buildMcpServer()
 
     server.tool(
         "screenshot",
-        "take a screenshot of the patch's rendering canvas and return it as a png image; use it to check what a change looks like. maxSize limits the longer edge in pixels (default " + SCREENSHOT_DEFAULT_MAX_SIZE + ", 0 = original size); larger images cost more tokens.",
-        { "maxSize": z.number().optional() },
+        "take a screenshot of the patch's rendering canvas and return it as a png image; use it to check what a change looks like. maxSize limits the longer edge in pixels (default " + SCREENSHOT_DEFAULT_MAX_SIZE + ", 0 = original size); larger images cost more tokens.", { "maxSize": z.number().optional() },
         async ({ maxSize }) =>
         {
             logMcp("screenshot");
@@ -2436,8 +2753,7 @@ function buildMcpServer()
 
     server.tool(
         "list-commands",
-        "list the cables editor commands (the same as in the command palette), with category and description. optional str filters by name/category/description. run them with run-command.",
-        { "str": z.string().optional() },
+        "list the cables editor commands (the same as in the command palette), with category and description. optional str filters by name/category/description. run them with run-command.", { "str": z.string().optional() },
         ({ str }) =>
         {
             logMcp("list commands" + (str ? " \"" + str + "\"" : ""));
@@ -2454,8 +2770,7 @@ function buildMcpServer()
 
     server.tool(
         "run-command",
-        "run a cables editor command by its name, exactly as listed by list-commands (the same as selecting it in the command palette). many commands act on the currently selected ops.",
-        { "name": z.string() },
+        "run a cables editor command by its name, exactly as listed by list-commands (the same as selecting it in the command palette). many commands act on the currently selected ops.", { "name": z.string() },
         async ({ name }) =>
         {
             logMcp("run command \"" + name + "\"");
@@ -2477,8 +2792,7 @@ function buildMcpServer()
 
     server.tool(
         "set-canvas-size",
-        "set the size of the rendering canvas in pixels, the same as the editor's \"change canvas size\" command",
-        { "width": z.number(), "height": z.number() },
+        "set the size of the rendering canvas in pixels, the same as the editor's \"change canvas size\" command", { "width": z.number(), "height": z.number() },
         ({ width, height }) =>
         {
             logMcp("set canvas size " + width + "x" + height);
@@ -2501,8 +2815,7 @@ function buildMcpServer()
 
     server.tool(
         "get-op-docs",
-        "get the documentation of an op by its full op name (objName), e.g. Ops.Gl.Meshes.Circle_v2: summary, description, port documentation, ports layout, libs/dependencies and whether a newer version exists (oldVersion)",
-        { "objName": z.string() },
+        "get the documentation of an op by its full op name (objName), e.g. Ops.Gl.Meshes.Circle_v2: summary, description, port documentation, ports layout, libs/dependencies and whether a newer version exists (oldVersion)", { "objName": z.string() },
         ({ objName }) =>
         {
             logMcp("op docs " + objName);
@@ -2516,8 +2829,7 @@ function buildMcpServer()
 
     server.tool(
         "list-op-docs",
-        "list all documented ops, one per line as \"name: summary\". optional str filters by name/summary. old versions and hidden ops are left out unless includeOld / includeHidden is true. use get-op-docs for the full documentation of an op.",
-        { "str": z.string().optional(), "includeOld": z.boolean().optional(), "includeHidden": z.boolean().optional() },
+        "list all documented ops, one per line as \"name: summary\". optional str filters by name/summary. old versions and hidden ops are left out unless includeOld / includeHidden is true. use get-op-docs for the full documentation of an op.", { "str": z.string().optional(), "includeOld": z.boolean().optional(), "includeHidden": z.boolean().optional() },
         ({ str, includeOld, includeHidden }) =>
         {
             logMcp("list op docs" + (str ? " \"" + str + "\"" : ""));
@@ -2536,8 +2848,7 @@ function buildMcpServer()
 
     server.tool(
         "get-patch-op",
-        "get one op instance from the current patch as serialized json, by its op id (see cables://patch.json for op ids): its current port values, uiAttribs, storage and outgoing links (incoming links are stored on the op they come from). this is the op as it is used in the patch, not its documentation (use get-op-docs for that) and not its source code (use cables://op/<name>).",
-        { "opId": z.string() },
+        "get one op instance from the current patch as serialized json, by its op id (see cables://patch.json for op ids): its current port values, uiAttribs, storage and outgoing links (incoming links are stored on the op they come from). this is the op as it is used in the patch, not its documentation (use get-op-docs for that) and not its source code (use cables://op/<name>).", { "opId": z.string() },
         ({ opId }) =>
         {
             logMcp("get patch op " + opLabel(opId));
@@ -2554,8 +2865,7 @@ function buildMcpServer()
 
     server.tool(
         "get-jobs",
-        "list what the editor is loading: \"ui\" are editor jobs (the ui loading indicator, e.g. loading op code or docs), \"patch\" are asset loading tasks started by ops in the patch (e.g. textures, files, libs). running entries show how long they have been running, one running for a long time is probably stuck. optional numFinished also lists the most recent finished entries of both with their duration.",
-        { "numFinished": z.number().optional() },
+        "list what the editor is loading: \"ui\" are editor jobs (the ui loading indicator, e.g. loading op code or docs), \"patch\" are asset loading tasks started by ops in the patch (e.g. textures, files, libs). running entries show how long they have been running, one running for a long time is probably stuck. optional numFinished also lists the most recent finished entries of both with their duration.", { "numFinished": z.number().optional() },
         ({ numFinished }) =>
         {
             logMcp("get jobs");
@@ -2595,8 +2905,7 @@ function buildMcpServer()
 
     server.tool(
         "get-build-info",
-        "build info of the code that is running in the editor right now (compiled into the bundles, not read from disk): when the ui and core were built and from which git commit. ageSeconds is how long ago that was. use it after reloading the editor to check that a change is live: created has to be newer than the edit. serverStarted is when this mcp server started (changes with every editor reload), loading/runningJobs tell if the editor or patch is still loading.",
-        {},
+        "build info of the code that is running in the editor right now (compiled into the bundles, not read from disk): when the ui and core were built and from which git commit. ageSeconds is how long ago that was. use it after reloading the editor to check that a change is live: created has to be newer than the edit. serverStarted is when this mcp server started (changes with every editor reload), loading/runningJobs tell if the editor or patch is still loading.", {},
         () =>
         {
             logMcp("get build info");
@@ -2614,11 +2923,14 @@ function buildMcpServer()
 
             let runningJobs = 0;
             const uiJobs = gui.jobs().getList();
-            for (let i = 0; i < uiJobs.length; i++) if (!uiJobs[i].finished) runningJobs++;
+            for (let i = 0; i < uiJobs.length; i++)
+                if (!uiJobs[i].finished) runningJobs++;
             const patchTasks = gui.corePatch().loading.getList();
-            for (let i = 0; i < patchTasks.length; i++) if (!patchTasks[i].finished) runningJobs++;
+            for (let i = 0; i < patchTasks.length; i++)
+                if (!patchTasks[i].finished) runningJobs++;
 
-            return respondText(JSON.stringify({
+            return respondText(JSON.stringify(
+            {
                 "now": new Date(now).toISOString(),
                 "serverStarted": window.cablesMcpServerStarted,
                 "loading": runningJobs > 0,
@@ -2632,8 +2944,7 @@ function buildMcpServer()
 
     server.tool(
         "reload-editor",
-        "reload the whole editor page, e.g. to load newly built ui code. this mcp server restarts with it, so the answer only confirms the reload was triggered. afterwards poll get-build-info until it answers again with a newer serverStarted and loading false. with unsaved changes it does not reload (the editor would block on a leave-page dialog) unless unsaved is \"save\" (save the patch first) or \"discard\" (reload without saving, the changes are lost).",
-        { "unsaved": z.enum(["save", "discard"]).optional() },
+        "reload the whole editor page, e.g. to load newly built ui code. this mcp server restarts with it, so the answer only confirms the reload was triggered. afterwards poll get-build-info until it answers again with a newer serverStarted and loading false. with unsaved changes it does not reload (the editor would block on a leave-page dialog) unless unsaved is \"save\" (save the patch first) or \"discard\" (reload without saving, the changes are lost).", { "unsaved": z.enum(["save", "discard"]).optional() },
         async ({ unsaved }) =>
         {
             logMcp("reload editor" + (unsaved ? " (" + unsaved + " unsaved)" : ""));
@@ -2665,8 +2976,7 @@ function buildMcpServer()
 
     server.tool(
         "ui-profiler-start",
-        "clear the editor's ui profiler and start measuring from now on (the same data as the ui profiler tab). every gui.uiProfiler.start(name)/finish() in the ui code is one measurement. do the actions to measure afterwards (e.g. select ops, drag, reload), then read the result with ui-profiler-read.",
-        {},
+        "clear the editor's ui profiler and start measuring from now on (the same data as the ui profiler tab). every gui.uiProfiler.start(name)/finish() in the ui code is one measurement. do the actions to measure afterwards (e.g. select ops, drag, reload), then read the result with ui-profiler-read.", {},
         () =>
         {
             logMcp("ui profiler start");
@@ -2680,8 +2990,7 @@ function buildMcpServer()
 
     server.tool(
         "ui-profiler-read",
-        "read the ui profiler measurements since ui-profiler-start: per measured name the count, average/max/last time in ms (over the most recent times the profiler keeps, see keptTimes) and estTotalMs (count * average). sorted by estTotalMs, so the biggest cost is first. optional filter only lists names containing that text, limit the number of entries (default 30).",
-        { "filter": z.string().optional(), "limit": z.number().optional() },
+        "read the ui profiler measurements since ui-profiler-start: per measured name the count, average/max/last time in ms (over the most recent times the profiler keeps, see keptTimes) and estTotalMs (count * average). sorted by estTotalMs, so the biggest cost is first. optional filter only lists names containing that text, limit the number of entries (default 30).", { "filter": z.string().optional(), "limit": z.number().optional() },
         ({ filter, limit }) =>
         {
             logMcp("ui profiler read");
@@ -2757,6 +3066,7 @@ const httpServer = http.createServer(async (req, res) =>
 // keep-alive connections of the mcp client would keep the port busy, so they are closed right away
 function stopServer(server)
 {
+    console.log("stop mcp")
     return new Promise((resolve) =>
     {
         if (!server || !server.listening) { resolve(); return; }
@@ -2836,7 +3146,7 @@ checkSingleServerOp();
 op.onDelete = (reloadingOp) =>
 {
     const wasRunning = isCurrentInstance();
-logMcp("stop mcp server");
+    logMcp("stop mcp server");
     if (window.cablesMcpHttpServer === httpServer) window.cablesMcpHttpServer = null;
     if (isCurrentInstance()) window.cablesMcpInstance = null;
     op.patch.off(opAddedListener);
