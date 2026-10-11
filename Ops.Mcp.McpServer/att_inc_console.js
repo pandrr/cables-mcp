@@ -116,3 +116,38 @@ function connectDevTools()
     if (!devToolsConnecting) devToolsConnecting = openDevToolsSocket().finally(() => { devToolsConnecting = null; });
     return devToolsConnecting;
 }
+
+// registers the tools of this file, called by buildMcpServer
+function registerConsoleTools(server)
+{
+    server.tool(
+        "get-console-logs",
+        "read the editor's console: console.log/warn/error, uncaught exceptions and browser messages like the yellow webgl warnings (GL_INVALID_OPERATION...). needs electron started with --remote-debugging-port=9222. minLevel: verbose, info, warning or error (default info). optional str filters by text, limit is the number of newest entries (default 100), clear empties the list afterwards.", { "minLevel": z.enum(CONSOLE_LEVELS).optional(), "str": z.string().optional(), "limit": z.number().optional(), "clear": z.boolean().optional() },
+        async ({ minLevel, str, limit, clear }) =>
+        {
+            logMcp("get console logs" + (str ? " \"" + str + "\"" : ""));
+
+            try
+            {
+                await connectDevTools();
+            }
+            catch (e)
+            {
+                return respondError("could not connect to devtools: " + e.message);
+            }
+
+            const minIndex = CONSOLE_LEVELS.indexOf(minLevel || "info");
+            const filter = (str || "").toLowerCase();
+            const lines = consoleEntries
+                .filter((e) => CONSOLE_LEVELS.indexOf(e.level) >= minIndex)
+                .filter((e) => !filter || e.text.toLowerCase().includes(filter))
+                .sort((a, b) => a.timestamp - b.timestamp)
+                .slice(-(limit || CONSOLE_DEFAULT_LIMIT))
+                .map((e) => new Date(e.timestamp).toLocaleTimeString() + " " + e.level + " [" + e.source + "] " + e.text + (e.location ? " (" + e.location + ")" : ""));
+
+            if (clear) consoleEntries.length = 0;
+
+            return respondText(lines.length ? lines.join("\n") : "no console entries" + (filter || minLevel ? " matching the filter" : ""));
+        }
+    );
+}

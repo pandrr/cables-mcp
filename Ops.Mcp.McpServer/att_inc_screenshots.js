@@ -89,3 +89,64 @@ function grabTimelineScreenshot(maxSize)
         glTimeline.needsUpdateAll = "mcp screenshot";
     });
 }
+
+// registers the tools of this file, called by buildMcpServer
+function registerScreenshotTools(server)
+{
+    server.tool(
+        "screenshot",
+        "take a screenshot of the patch's rendering canvas and return it as a png image; use it to check what a change looks like. maxSize limits the longer edge in pixels (default " + SCREENSHOT_DEFAULT_MAX_SIZE + ", 0 = original size); larger images cost more tokens.", { "maxSize": z.number().optional() },
+        async ({ maxSize }) =>
+        {
+            logMcp("screenshot");
+
+            try
+            {
+                const png = await grabScreenshot(maxSize ?? SCREENSHOT_DEFAULT_MAX_SIZE);
+                return respond({ "content": [{ "type": "image", "data": png, "mimeType": "image/png" }] });
+            }
+            catch (e)
+            {
+                return respondError("screenshot failed: " + e.message);
+            }
+        }
+    );
+
+    server.tool(
+        "patch-field-screenshot",
+        "take a screenshot of the patch field (the editor's op graph with ops and links, not the rendering canvas) as a png image. maxSize limits the longer edge in pixels (default " + SCREENSHOT_DEFAULT_MAX_SIZE + ", 0 = original size). use patch-view to scroll/zoom first; panels on top of the patch field are not in the image.", { "maxSize": z.number().optional() },
+        async ({ maxSize }) =>
+        {
+            logMcp("patch field screenshot");
+
+            try
+            {
+                const png = await grabPatchFieldScreenshot(maxSize ?? SCREENSHOT_DEFAULT_MAX_SIZE);
+                return respond({ "content": [{ "type": "image", "data": png, "mimeType": "image/png" }] });
+            }
+            catch (e)
+            {
+                return respondError("patch field screenshot failed: " + e.message);
+            }
+        }
+    );
+
+    server.tool(
+        "timeline-screenshot",
+        "take a screenshot of the timeline panel (ruler, overview, keys and curves) as a png image. only the gl canvas: the html line titles and buttons are not in the image. maxSize limits the longer edge in pixels (default " + SCREENSHOT_DEFAULT_MAX_SIZE + ", 0 = original size). the timeline has to be open (command \"Show timeline\").", { "maxSize": z.number().optional() },
+        async ({ maxSize }) =>
+        {
+            logMcp("timeline screenshot");
+
+            try
+            {
+                const png = await grabTimelineScreenshot(maxSize ?? SCREENSHOT_DEFAULT_MAX_SIZE);
+                return respond({ "content": [{ "type": "image", "data": png, "mimeType": "image/png" }] });
+            }
+            catch (e)
+            {
+                return respondError("timeline screenshot failed: " + e.message);
+            }
+        }
+    );
+}

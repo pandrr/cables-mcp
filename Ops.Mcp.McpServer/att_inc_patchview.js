@@ -58,3 +58,101 @@ function patchViewInfo()
         "fieldSize": size
     };
 }
+
+// registers the tools of this file, called by buildMcpServer
+function registerPatchViewTools(server)
+{
+    server.tool(
+        "patch-view",
+        "scroll/zoom the patch field (the editor's op graph, not the rendering canvas). fit=true zooms to show all ops of the current subpatch, opIds fits the view to those ops, x/y center the view on a patch coordinate (the same coordinates as op positions), zoom is half the visible width in patch units (bigger = further out). without arguments it only reports the current view. returns the visible area in patch coordinates. take a look with patch-field-screenshot.", { "fit": z.boolean().optional(), "opIds": z.array(z.string()).optional(), "x": z.number().optional(), "y": z.number().optional(), "zoom": z.number().optional() },
+        async ({ fit, opIds, x, y, zoom }) =>
+        {
+            logMcp("patch view");
+
+            if (opIds)
+            {
+                const ops = opIds.map((opId) => CABLES.patch.getOpById(opId));
+                const missing = opIds.filter((opId, i) => !ops[i]);
+                if (missing.length) return respondError("no op found with id " + missing.join(", "));
+                fitPatchView(ops);
+            }
+            else if (fit)
+            {
+                const ops = visiblePatchOps();
+                if (!ops.length) return respondError("no ops in the current subpatch");
+                fitPatchView(ops);
+            }
+            else if ((x === undefined) != (y === undefined)) return respondError("pass both x and y");
+            else setPatchView(x, y, zoom);
+
+            // view changes are animated, report the view once they are done
+            await new Promise((resolve) => { setTimeout(resolve, PATCHFIELD_VIEW_ANIM_MS); });
+            return respondText(JSON.stringify(patchViewInfo()));
+        }
+    );
+
+    server.tool(
+        "focus-op",
+        "scroll/zoom the patch editor view to center on an op and open its param panel, so the person looking at the editor can see it. does not affect rendering.", { "opId": z.string() },
+        ({ opId }) =>
+        {
+            logMcp("focus " + opLabel(opId));
+
+            const targetOp = CABLES.patch.getOpById(opId);
+            if (!targetOp) return respondError("no op found with id " + opId);
+
+            if (!CABLES.UI || !gui.patchView || !gui.patchView.patchRenderer || !gui.patchView.patchRenderer.focusOp) return respondError("no patch editor UI available to focus on");
+
+            gui.patchView.patchRenderer.focusOp(opId);
+
+            return respondText("focused " + opId + " (" + targetOp.objName + ") in the patch editor");
+        }
+    );
+
+    server.tool(
+        "select-op",
+        "select ops in the patch editor, like clicking them. commands from run-command act on the selected ops. opIds is a list of op ids, add true keeps the current selection, otherwise it is cleared first.", { "opIds": z.array(z.string()), "add": z.boolean().optional() },
+        ({ opIds, add }) =>
+        {
+            logMcp("select " + opIds.map((opId) => { return opLabel(opId); }).join(", "));
+
+            if (!CABLES.UI || !gui.patchView) return respondError("no patch editor UI available to select in");
+
+            const missing = opIds.filter((opId) => { return !CABLES.patch.getOpById(opId); });
+            if (missing.length > 0) return respondError("no op found with id " + missing.join(", "));
+
+            if (!add) gui.patchView.unselectAllOps();
+            opIds.forEach((opId) => { gui.patchView.selectOpId(opId); });
+
+            const selected = gui.patchView.getSelectedOps().map((selOp) => { return selOp.id + " (" + selOp.objName + ")"; });
+            return respondText("selected: " + selected.join(", "));
+        }
+    );
+
+    server.tool(
+        "move-op",
+        "reposition an existing op in the patch editor view (does not affect rendering, purely cosmetic layout); identify the op by its id and give its new x/y editor coordinates", { "opId": z.string(), "x": z.number(), "y": z.number() },
+        ({ opId, x, y }) =>
+        {
+            logMcp("move " + opLabel(opId) + " to " + x + "," + y);
+
+            const targetOp = CABLES.patch.getOpById(opId);
+            if (!targetOp) return respondError("no op found with id " + opId);
+
+            const old = targetOp.uiAttribs.translate || { "x": 0, "y": 0 };
+            const oldX = old.x,
+                oldY = old.y;
+            const moveTo = (px, py) => { gui.patchView.patchRenderer.patchAPI.setOpUiAttribs(opId, "translate", { "x": px, "y": py }); };
+
+            moveTo(x, y);
+            CABLES.UI.undo.add(
+            {
+                "title": "Move op",
+                "undo": () => { moveTo(oldX, oldY); },
+                "redo": () => { moveTo(x, y); }
+            });
+
+            return respondText("moved " + opId + " to " + x + "," + y);
+        }
+    );
+}

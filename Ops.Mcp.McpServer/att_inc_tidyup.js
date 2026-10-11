@@ -564,3 +564,38 @@ function applyOpPositions(pos)
     CABLES.UI.undo.endGroup(undoGroup, "Tidy up ops");
     return moved;
 }
+
+// registers the tools of this file, called by buildMcpServer
+function registerTidyUpTools(server)
+{
+    server.tool(
+        "tidy-up-ops",
+        "tidy up the layout of ops: arranges them in rows following their links (every op below all ops linked to its inputs), each op at the x of the op above until the links split, split children side by side in port order. ops never overlap. unselected ops are never moved, the selected ops are placed around them. links may cross. snapped to the grid. works on the selected ops, or on opIds; all have to be in the current subpatch. undoable as one step. if no valid layout is found (link cycle, no free place) nothing is changed and the reason is returned.", { "opIds": z.array(z.string()).optional(), "dryRun": z.boolean().optional() },
+        ({ opIds, dryRun }) =>
+        {
+            logMcp("tidy up ops");
+
+            let ops = gui.patchView.getSelectedOps();
+            if (opIds)
+            {
+                ops = opIds.map((opId) => CABLES.patch.getOpById(opId));
+                const missing = opIds.filter((opId, i) => !ops[i]);
+                if (missing.length) return respondError("no op found with id " + missing.join(", "));
+            }
+            if (!ops.length) ops = visiblePatchOps();
+
+            const sub = gui.patchView.getCurrentSubPatch();
+            const outside = ops.filter((o) => (o.uiAttribs.subPatch || 0) != sub || !o.uiAttribs.translate || !gui.patchView.patchRenderer.getGlOp(o));
+            if (outside.length) return respondError("ops not in the current subpatch: " + outside.map((o) => o.id).join(", "));
+
+            const pos = layoutOps(ops);
+            if (typeof pos == "string") return respondError("nothing changed: " + pos);
+
+            if (dryRun) return respondText([...pos].map(([o, p]) => o.id + " " + p.x + "," + p.y).join("\n"));
+
+            const moved = applyOpPositions(pos);
+            fitPatchView(ops);
+            return respondText(JSON.stringify({ "ops": ops.length, "moved": moved, "rows": new Set([...pos.values()].map((p) => p.y)).size }));
+        }
+    );
+}
