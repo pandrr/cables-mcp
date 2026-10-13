@@ -62,10 +62,15 @@ async function writeOpAttachment(opname, name, content)
     return created;
 }
 
+// ops created via mcp always live in the local namespace
+const CREATE_OP_NAMESPACE = "Ops.Local.";
+
 // creates a new op (the location follows from its name), optionally with code and attachments { "att_name": content }, and loads it.
 // attachments are written afterwards, passing them to opCreate fails in electron when the project has op dirs
 async function createOp(opname, code, attachments)
 {
+    if (!opname.startsWith(CREATE_OP_NAMESPACE) || opname.length <= CREATE_OP_NAMESPACE.length) throw new Error("op name has to start with " + CREATE_OP_NAMESPACE + ", e.g. " + CREATE_OP_NAMESPACE + "MyOp");
+
     const req = { "opname": opname };
     if (code) req.code = code;
 
@@ -298,7 +303,7 @@ function registerOpFileTools(server)
 
     server.tool(
         "create-op",
-        "create a new op by its full name (e.g. Ops.Extension.ShaderGraph.Sdf.Sphere, the name decides where it is stored), optionally with its code and attachments as { \"att_name\": content } (att_ prefix optional). add it to the patch with add-op afterwards.", { "opname": z.string(), "code": z.string().optional(), "attachments": z.record(z.string()).optional() },
+        "create a new op by its full name, which has to start with Ops.Local. (e.g. Ops.Local.Sdf.Sphere, other namespaces are rejected), optionally with its code and attachments as { \"att_name\": content } (att_ prefix optional). add it to the patch with add-op afterwards.", { "opname": z.string(), "code": z.string().optional(), "attachments": z.record(z.string()).optional() },
         async ({ opname, code, attachments }) =>
         {
             logMcp("create op " + opname);
@@ -397,4 +402,97 @@ function registerOpFileTools(server)
             }
         }
     );
+
+    server.tool(
+        "read-op-dependency",
+        "read the content of a local dependency file of an op (e.g. ./lib.js from the op's dependencies, see get-op-docs). fromLine/toLine limit it to a range of lines, find only lists the lines containing that text.", { "opname": z.string(), "name": z.string(), "fromLine": z.number().optional(), "toLine": z.number().optional(), "find": z.string().optional() },
+        async ({ opname, name, fromLine, toLine, find }) =>
+        {
+            logMcp("read dependency " + opname + "/" + name);
+
+            try
+            {
+                const lines = (await readOpDependency(opname, name)).split("\n");
+                const from = Math.max(1, fromLine || 1);
+                const to = Math.min(lines.length, toLine || lines.length);
+
+                let text = lines.length + " lines\n";
+                for (let i = from; i <= to; i++)
+                {
+                    if (find && lines[i - 1].indexOf(find) == -1) continue;
+                    text += i + "\t" + lines[i - 1] + "\n";
+                }
+                return respondText(text);
+            }
+            catch (e)
+            {
+                return respondError("could not read dependency: " + e.message);
+            }
+        }
+    );
+
+    server.tool(
+        "write-op-dependency",
+        "write the full content of a local dependency file of an op (name like lib.js, stored next to the op code) and add it to the op's dependencies if it is not listed yet. type is commonjs (default, loaded as a script) or module (es module, then export names the global it is made available as). the op is re-executed afterwards; an already loaded library may need an editor reload to pick up changed code.", { "opname": z.string(), "name": z.string(), "content": z.string(), "type": z.enum(["commonjs", "module"]).optional(), "export": z.string().optional(), "execute": z.boolean().optional() },
+        async ({ opname, name, content, type, "export": exportName, execute }) =>
+        {
+            logMcp("write dependency " + opname + "/" + name);
+
+            try
+            {
+                const added = await writeOpDependency(opname, name, content, type || "commonjs", exportName);
+                if (execute !== false) await executeOp(opname);
+
+                return respondText("saved " + dependencySrc(name) + (added ? ", added to dependencies" : "") + (execute !== false ? ", op re-executed" : ""));
+            }
+            catch (e)
+            {
+                return respondError("could not write dependency: " + e.message);
+            }
+        }
+    );
+}
+
+function dependencySrc(name)
+{
+    return name.startsWith("./") ? name : "./" + name;
+}
+
+async function readOpDependency(opname, name)
+{
+    const opDoc = getOpDocOrThrow(opname);
+    const res = await talkerSend("getOpDependency", { "opname": opDoc.id, "name": dependencySrc(name) });
+    let content = res ? res.content : undefined;
+    if (content === undefined && res && res.data) content = res.data.content;
+    if (content === undefined || content === null) throw new Error("no dependency file " + dependencySrc(name) + " in op " + opname);
+    return content;
+}
+
+// the upload talker command turns the decoded base64 string into utf8 itself, so only strings without chars above 255 survive it,
+// others are saved through the attachment path, which formats js of core ops
+async function writeOpDependency(opname, name, content, type, exportName)
+{
+    const opDoc = getOpDocOrThrow(opname);
+    const src = dependencySrc(name);
+    const fileName = src.substring(2);
+
+    if (/^[\u0000-ÿ]*$/.test(content))
+    {
+        await withTimeout(talkerSend("uploadFileToOp", { "opId": opDoc.id, "filename": fileName, "fileStr": "data:text/plain;base64," + btoa(content) }), 10000, "uploadFileToOp");
+    }
+    else
+    {
+        await withTimeout(talkerSend("uploadFileToOp", { "opId": opDoc.id, "filename": fileName, "fileStr": "data:text/plain;base64," + btoa(" ") }), 10000, "uploadFileToOp");
+        await withTimeout(talkerSend("saveOpDependency", { "opname": opDoc.id, "name": fileName, "content": content }), 10000, "saveOpDependency");
+    }
+
+    const deps = opDoc.dependencies || [];
+    for (let i = 0; i < deps.length; i++)
+        if (deps[i].src === src) return false;
+
+    const dep = { "opName": opDoc.id, "src": src, "type": type };
+    if (exportName) dep.export = exportName;
+    await withTimeout(talkerSend("addOpDependency", dep), 60000, "addOpDependency");
+    gui.emitEvent("refreshManageOp", opDoc.name);
+    return true;
 }
