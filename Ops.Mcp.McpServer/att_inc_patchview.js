@@ -130,6 +130,27 @@ function registerPatchViewTools(server)
     );
 
     server.tool(
+        "bookmark-op",
+        "bookmark an op in the patch editor (like the bookmark button in its param panel) so it shows up in the bookmarks list and the command palette. bookmarked false removes the bookmark, default true. bookmarks are stored with the patch, save it afterwards.", { "opId": z.string(), "bookmarked": z.boolean().optional() },
+        ({ opId, bookmarked }) =>
+        {
+            const wanted = bookmarked !== false;
+            logMcp((wanted ? "bookmark " : "unbookmark ") + opLabel(opId));
+
+            const targetOp = CABLES.patch.getOpById(opId);
+            if (!targetOp) return respondError("no op found with id " + opId);
+            if (!CABLES.UI || !gui.bookmarks) return respondError("no patch editor UI available for bookmarks");
+
+            const isBookmarked = gui.bookmarks.hasBookmarkWithId(opId);
+            if (wanted && !isBookmarked) gui.bookmarks.add(opId);
+            if (!wanted && isBookmarked) gui.bookmarks.remove(opId);
+
+            const state = gui.bookmarks.hasBookmarkWithId(opId) ? "bookmarked" : "not bookmarked";
+            return respondText(opId + " (" + targetOp.objName + ") is " + state);
+        }
+    );
+
+    server.tool(
         "move-op",
         "reposition an existing op in the patch editor view (does not affect rendering, purely cosmetic layout); identify the op by its id and give its new x/y editor coordinates", { "opId": z.string(), "x": z.number(), "y": z.number() },
         ({ opId, x, y }) =>
