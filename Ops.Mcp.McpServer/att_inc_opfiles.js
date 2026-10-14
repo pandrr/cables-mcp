@@ -451,6 +451,136 @@ function registerOpFileTools(server)
             }
         }
     );
+
+    server.tool(
+        "list-op-dependencies",
+        "list the dependencies of an op (src, type, export) and the dependency types this platform supports", { "opname": z.string() },
+        async ({ opname }) =>
+        {
+            logMcp("list dependencies " + opname);
+
+            try
+            {
+                const opDoc = getOpDocOrThrow(opname);
+                return respondText(JSON.stringify({ "dependencies": opDoc.dependencies || [], "supportedTypes": CABLES.platform.getSupportedOpDependencyTypes() }, null, 1));
+            }
+            catch (e)
+            {
+                return respondError("could not list dependencies: " + e.message);
+            }
+        }
+    );
+
+    server.tool(
+        "add-op-dependency",
+        "add a dependency to an op, or change type/export of an existing one with the same src. src is a url (lib/commonjs/module), a local file like ./lib.js (see write-op-dependency), an npm package name like three@0.160.0 (npm), a corelib name (corelib) or an op name (op). export names the global an es module (type module) is made available as. the dependencies are loaded and the op is re-executed afterwards.", { "opname": z.string(), "src": z.string(), "type": z.string(), "export": z.string().optional(), "execute": z.boolean().optional() },
+        async ({ opname, src, type, "export": exportName, execute }) =>
+        {
+            logMcp("add dependency " + opname + " " + src);
+
+            try
+            {
+                const opDoc = getOpDocOrThrow(opname);
+                const supportedTypes = CABLES.platform.getSupportedOpDependencyTypes();
+                if (!supportedTypes.includes(type)) return respondError("unsupported dependency type " + type + ", use one of: " + supportedTypes.join(", "));
+
+                const existing = findOpDependency(opDoc, src);
+                if (existing)
+                {
+                    if (existing.type == type && (existing.export || "") == (exportName || "")) return respondText(src + " is already a " + type + " dependency of " + opname);
+                    await removeOpDependency(opDoc, existing);
+                }
+
+                await addOpDependency(opDoc, src, type, exportName);
+                if (execute !== false) await executeOp(opname);
+
+                return respondText((existing ? "changed " : "added ") + type + " dependency " + src + (execute !== false ? ", op re-executed" : ""));
+            }
+            catch (e)
+            {
+                return respondError("could not add dependency: " + e.message);
+            }
+        }
+    );
+
+    server.tool(
+        "remove-op-dependency",
+        "remove a dependency from an op by its src (see list-op-dependencies). a local dependency file stays next to the op code. the op is re-executed afterwards.", { "opname": z.string(), "src": z.string(), "execute": z.boolean().optional() },
+        async ({ opname, src, execute }) =>
+        {
+            logMcp("remove dependency " + opname + " " + src);
+
+            try
+            {
+                const opDoc = getOpDocOrThrow(opname);
+                const existing = findOpDependency(opDoc, src);
+                if (!existing) return respondError(opname + " has no dependency " + src + ", see list-op-dependencies");
+
+                await removeOpDependency(opDoc, existing);
+                if (execute !== false) await executeOp(opname);
+
+                return respondText("removed " + existing.type + " dependency " + src + (execute !== false ? ", op re-executed" : ""));
+            }
+            catch (e)
+            {
+                return respondError("could not remove dependency: " + e.message);
+            }
+        }
+    );
+}
+
+function findOpDependency(opDoc, src)
+{
+    const deps = opDoc.dependencies || [];
+    for (let i = 0; i < deps.length; i++)
+        if (deps[i].src === src) return deps[i];
+    return null;
+}
+
+function reloadOpDependencies(opDoc)
+{
+    return new Promise((resolve) =>
+    {
+        const timeout = setTimeout(resolve, 60000);
+        gui.serverOps.loadOpDependencies(opDoc.id, () =>
+        {
+            clearTimeout(timeout);
+            resolve();
+        }, true);
+    });
+}
+
+async function addOpDependency(opDoc, src, type, exportName)
+{
+    const dep = { "opName": opDoc.id, "src": src, "type": type };
+    if (exportName) dep.export = exportName;
+
+    await withTimeout(new Promise((resolve, reject) =>
+    {
+        CABLESUILOADER.talkerAPI.send("addOpDependency", dep, (err) =>
+        {
+            if (!err) resolve();
+            else if (err.msg === "NPM_ERROR" && err.data) reject(new Error("npm: " + err.data.stderr));
+            else reject(new Error(err.msg || JSON.stringify(err)));
+        });
+    }), 120000, "addOpDependency");
+
+    opDoc.dependencies = opDoc.dependencies || [];
+    const newDep = { "src": src, "type": type };
+    if (exportName) newDep.export = exportName;
+    opDoc.dependencies.push(newDep);
+
+    await reloadOpDependencies(opDoc);
+    gui.emitEvent("refreshManageOp", opDoc.name);
+}
+
+async function removeOpDependency(opDoc, dep)
+{
+    await withTimeout(talkerSend("removeOpDependency", { "opName": opDoc.id, "src": dep.src, "type": dep.type }), 60000, "removeOpDependency");
+    opDoc.dependencies.splice(opDoc.dependencies.indexOf(dep), 1);
+
+    await reloadOpDependencies(opDoc);
+    gui.emitEvent("refreshManageOp", opDoc.name);
 }
 
 function dependencySrc(name)
