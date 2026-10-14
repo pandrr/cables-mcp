@@ -515,6 +515,59 @@ function buildMcpServer()
     );
 
     server.tool(
+        "patch-profiler-read",
+        "per-op cpu cost of the running patch (the same data as the Patch Profiler tab): starts op profiling if needed (it stays active with a small overhead until the editor reloads), waits durationMs (default 3000) and lists the most expensive ops: ms per second, peak ms of one call, triggers in the last frame, op name, title and subpatch. limit is the number of ops (default 30).", { "durationMs": z.number().optional(), "limit": z.number().optional() },
+        async ({ durationMs, limit }) =>
+        {
+            logMcp("patch profiler read");
+
+            const patch = gui.corePatch();
+            if (!patch.profiler || !patch.profilerStartedByMcp)
+            {
+                patch.profile(true);
+                patch.profilerStartedByMcp = true;
+            }
+            patch.profiler.clear();
+
+            await new Promise((resolve) => { setTimeout(resolve, durationMs || 3000); });
+
+            const items = patch.profiler.getItems();
+            const perOp = {};
+            for (const id in items)
+            {
+                const item = items[id];
+                if (!perOp[item.opid]) perOp[item.opid] = { "msPerSecond": 0, "peakMs": 0, "triggers": 0, "ports": [] };
+                const entry = perOp[item.opid];
+                entry.msPerSecond += item.timePsMs || 0;
+                entry.peakMs = Math.max(entry.peakMs, item.peak || 0);
+                entry.triggers += item.numTriggers || 0;
+                entry.ports.push(item.title);
+            }
+
+            let totalMsPerSecond = 0;
+            const list = [];
+            for (const opid in perOp)
+            {
+                const op = patch.getOpById(opid);
+                const entry = perOp[opid];
+                totalMsPerSecond += entry.msPerSecond;
+                list.push({
+                    "opId": opid,
+                    "objName": op ? op.objName : "?",
+                    "title": op ? op.getTitle() : "",
+                    "subPatch": op ? op.uiAttribs.subPatch : "",
+                    "msPerSecond": round3(entry.msPerSecond),
+                    "peakMs": round3(entry.peakMs),
+                    "triggers": entry.triggers
+                });
+            }
+            list.sort((a, b) => b.msPerSecond - a.msPerSecond);
+
+            return respondText(JSON.stringify({ "profiledOps": list.length, "totalMsPerSecond": round3(totalMsPerSecond), "ops": list.slice(0, limit || 30) }));
+        }
+    );
+
+    server.tool(
         "debug-glop",
         "temporary: debug info of an op's glop (size, area size)", { "opId": z.string() },
         ({ opId }) =>
