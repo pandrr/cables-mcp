@@ -126,7 +126,7 @@ function countOccurrences(text, part)
 // lines with their line numbers, like cat -n
 function numberedLines(lines, firstLine)
 {
-    return lines.map((line, i) => (firstLine + i) + "\t" + line).join("\n");
+    return lines.map((line, i) => { return (firstLine + i) + "\t" + line; }).join("\n");
 }
 
 // reloads the code of an op in all its instances in the patch
@@ -217,7 +217,8 @@ function registerOpFileTools(server)
 {
     server.tool(
         "read-op",
-        "read the code of an op (or one of its attachments, att_ prefix optional) with line numbers, much cheaper than reading the whole file: fromLine/toLine limit it to a range of lines, find only lists the lines containing that text, without attachment it also searches the op's include attachments (att_inc_*.js) and prefixes each line with its file name. use edit-op-text to change it.", { "opname": z.string(), "attachment": z.string().optional(), "fromLine": z.number().optional(), "toLine": z.number().optional(), "find": z.string().optional() },
+        "read the code of an op (or one of its attachments, att_ prefix optional) with line numbers, much cheaper than reading the whole file: fromLine/toLine limit it to a range of lines, find only lists the lines containing that text, without attachment it also searches the op's include attachments (att_inc_*.js) and prefixes each line with its file name. use edit-op-text to change it.",
+        { "opname": z.string(), "attachment": z.string().optional(), "fromLine": z.number().optional(), "toLine": z.number().optional(), "find": z.string().optional() },
         async ({ opname, attachment, fromLine, toLine, find }) =>
         {
             logMcp("read op " + opname + (attachment ? "/" + attachmentFileName(attachment) : ""));
@@ -249,7 +250,8 @@ function registerOpFileTools(server)
 
     server.tool(
         "edit-op-text",
-        "change the code of an op (or one of its attachments, att_ prefix optional) by replacing oldText with newText, without sending the whole file. oldText has to match exactly once (copy it from read-op without the line numbers, include enough surrounding lines to make it unique), or pass replaceAll=true to replace every occurrence. the op is saved and re-executed afterwards.", { "opname": z.string(), "attachment": z.string().optional(), "oldText": z.string(), "newText": z.string(), "replaceAll": z.boolean().optional() },
+        "change the code of an op (or one of its attachments, att_ prefix optional) by replacing oldText with newText, without sending the whole file. oldText has to match exactly once (copy it from read-op without the line numbers, include enough surrounding lines to make it unique), or pass replaceAll=true to replace every occurrence. the op is saved and re-executed afterwards.",
+        { "opname": z.string(), "attachment": z.string().optional(), "oldText": z.string(), "newText": z.string(), "replaceAll": z.boolean().optional() },
         async ({ opname, attachment, oldText, newText, replaceAll }) =>
         {
             logMcp("edit op " + opname + (attachment ? "/" + attachmentFileName(attachment) : ""));
@@ -274,7 +276,8 @@ function registerOpFileTools(server)
 
     server.tool(
         "edit-op",
-        "open an op to edit and change it", { "opname": z.string() },
+        "open an op to edit and change it",
+        { "opname": z.string() },
         (opts) =>
         {
             logMcp("edit op " + opts.opname);
@@ -285,7 +288,8 @@ function registerOpFileTools(server)
 
     server.tool(
         "write-opened-resources",
-        "change/write content of an opened file", { "uri": z.string(), "text": z.string() },
+        "change/write content of an opened file",
+        { "uri": z.string(), "text": z.string() },
         ({ uri, text }) =>
         {
             logMcp("write file " + uriLabel(uri));
@@ -303,7 +307,8 @@ function registerOpFileTools(server)
 
     server.tool(
         "create-op",
-        "create a new op by its full name, which has to start with Ops.Local. (e.g. Ops.Local.Sdf.Sphere, other namespaces are rejected), optionally with its code and attachments as { \"att_name\": content } (att_ prefix optional). add it to the patch with add-op afterwards.", { "opname": z.string(), "code": z.string().optional(), "attachments": z.record(z.string()).optional() },
+        "create a new op by its full name, which has to start with Ops.Local. (e.g. Ops.Local.Sdf.Sphere, other namespaces are rejected), optionally with its code and attachments as { \"att_name\": content } (att_ prefix optional). add it to the patch with add-op afterwards.",
+        { "opname": z.string(), "code": z.string().optional(), "attachments": z.record(z.string()).optional() },
         async ({ opname, code, attachments }) =>
         {
             logMcp("create op " + opname);
@@ -324,7 +329,8 @@ function registerOpFileTools(server)
 
     server.tool(
         "list-op-attachments",
-        "list the attachment files of an op (e.g. att_inc_node.js, att_shader.vert), by full op name. read them with read-op-attachment, change them with write-op-attachment.", { "opname": z.string() },
+        "list the attachment files of an op (e.g. att_inc_node.js, att_shader.vert), by full op name. read them with read-op-attachment, change them with write-op-attachment.",
+        { "opname": z.string() },
         ({ opname }) =>
         {
             logMcp("list attachments " + opname);
@@ -339,7 +345,8 @@ function registerOpFileTools(server)
 
     server.tool(
         "read-op-attachment",
-        "read the content of an op attachment file by full op name and attachment name (e.g. att_inc_node.js, the att_ prefix is optional); see list-op-attachments", { "opname": z.string(), "name": z.string() },
+        "read the content of an op attachment file by full op name and attachment name (e.g. att_inc_node.js, the att_ prefix is optional); see list-op-attachments",
+        { "opname": z.string(), "name": z.string() },
         async ({ opname, name }) =>
         {
             logMcp("read attachment " + opname + "/" + attachmentFileName(name));
@@ -357,7 +364,8 @@ function registerOpFileTools(server)
 
     server.tool(
         "write-op-attachment",
-        "write the full content of an op attachment file (the att_ prefix is optional), creating it if the op does not have it yet. att_inc_*.js files are included into the op code, other attachments are available in the op as attachments.<name> (dots replaced by _). by default the op is re-executed afterwards so all instances in the patch use the new code; pass execute=false when writing several attachments and only execute on the last one.", { "opname": z.string(), "name": z.string(), "content": z.string(), "execute": z.boolean().optional() },
+        "write the full content of an op attachment file (the att_ prefix is optional), creating it if the op does not have it yet. att_inc_*.js files are included into the op code, other attachments are available in the op as attachments.<name> (dots replaced by _). by default the op is re-executed afterwards so all instances in the patch use the new code; pass execute=false when writing several attachments and only execute on the last one.",
+        { "opname": z.string(), "name": z.string(), "content": z.string(), "execute": z.boolean().optional() },
         async ({ opname, name, content, execute }) =>
         {
             logMcp("write attachment " + opname + "/" + attachmentFileName(name));
@@ -378,7 +386,8 @@ function registerOpFileTools(server)
 
     server.tool(
         "delete-op-attachment",
-        "delete an attachment file of an op by full op name and attachment name (the att_ prefix is optional), see list-op-attachments. by default the op is re-executed afterwards so all instances in the patch use the code without it; pass execute=false when deleting several attachments and only execute on the last one.", { "opname": z.string(), "name": z.string(), "execute": z.boolean().optional() },
+        "delete an attachment file of an op by full op name and attachment name (the att_ prefix is optional), see list-op-attachments. by default the op is re-executed afterwards so all instances in the patch use the code without it; pass execute=false when deleting several attachments and only execute on the last one.",
+        { "opname": z.string(), "name": z.string(), "execute": z.boolean().optional() },
         async ({ opname, name, execute }) =>
         {
             const fileName = attachmentFileName(name);
@@ -405,7 +414,8 @@ function registerOpFileTools(server)
 
     server.tool(
         "read-op-dependency",
-        "read the content of a local dependency file of an op (e.g. ./lib.js from the op's dependencies, see get-op-docs). fromLine/toLine limit it to a range of lines, find only lists the lines containing that text.", { "opname": z.string(), "name": z.string(), "fromLine": z.number().optional(), "toLine": z.number().optional(), "find": z.string().optional() },
+        "read the content of a local dependency file of an op (e.g. ./lib.js from the op's dependencies, see get-op-docs). fromLine/toLine limit it to a range of lines, find only lists the lines containing that text.",
+        { "opname": z.string(), "name": z.string(), "fromLine": z.number().optional(), "toLine": z.number().optional(), "find": z.string().optional() },
         async ({ opname, name, fromLine, toLine, find }) =>
         {
             logMcp("read dependency " + opname + "/" + name);
@@ -433,7 +443,8 @@ function registerOpFileTools(server)
 
     server.tool(
         "write-op-dependency",
-        "write the full content of a local dependency file of an op (name like lib.js, stored next to the op code) and add it to the op's dependencies if it is not listed yet. type is commonjs (default, loaded as a script) or module (es module, then export names the global it is made available as). the op is re-executed afterwards; an already loaded library may need an editor reload to pick up changed code.", { "opname": z.string(), "name": z.string(), "content": z.string(), "type": z.enum(["commonjs", "module"]).optional(), "export": z.string().optional(), "execute": z.boolean().optional() },
+        "write the full content of a local dependency file of an op (name like lib.js, stored next to the op code) and add it to the op's dependencies if it is not listed yet. type is commonjs (default, loaded as a script) or module (es module, then export names the global it is made available as). the op is re-executed afterwards; an already loaded library may need an editor reload to pick up changed code.",
+        { "opname": z.string(), "name": z.string(), "content": z.string(), "type": z.enum(["commonjs", "module"]).optional(), "export": z.string().optional(), "execute": z.boolean().optional() },
         async ({ opname, name, content, type, "export": exportName, execute }) =>
         {
             logMcp("write dependency " + opname + "/" + name);
@@ -454,7 +465,8 @@ function registerOpFileTools(server)
 
     server.tool(
         "list-op-dependencies",
-        "list the dependencies of an op (src, type, export) and the dependency types this platform supports", { "opname": z.string() },
+        "list the dependencies of an op (src, type, export) and the dependency types this platform supports",
+        { "opname": z.string() },
         async ({ opname }) =>
         {
             logMcp("list dependencies " + opname);
@@ -473,7 +485,8 @@ function registerOpFileTools(server)
 
     server.tool(
         "add-op-dependency",
-        "add a dependency to an op, or change type/export of an existing one with the same src. src is a url (lib/commonjs/module), a local file like ./lib.js (see write-op-dependency), an npm package name like three@0.160.0 (npm), a corelib name (corelib) or an op name (op). export names the global an es module (type module) is made available as. the dependencies are loaded and the op is re-executed afterwards.", { "opname": z.string(), "src": z.string(), "type": z.string(), "export": z.string().optional(), "execute": z.boolean().optional() },
+        "add a dependency to an op, or change type/export of an existing one with the same src. src is a url (lib/commonjs/module), a local file like ./lib.js (see write-op-dependency), an npm package name like three@0.160.0 (npm), a corelib name (corelib) or an op name (op). export names the global an es module (type module) is made available as. the dependencies are loaded and the op is re-executed afterwards.",
+        { "opname": z.string(), "src": z.string(), "type": z.string(), "export": z.string().optional(), "execute": z.boolean().optional() },
         async ({ opname, src, type, "export": exportName, execute }) =>
         {
             logMcp("add dependency " + opname + " " + src);
@@ -505,7 +518,8 @@ function registerOpFileTools(server)
 
     server.tool(
         "remove-op-dependency",
-        "remove a dependency from an op by its src (see list-op-dependencies). a local dependency file stays next to the op code. the op is re-executed afterwards.", { "opname": z.string(), "src": z.string(), "execute": z.boolean().optional() },
+        "remove a dependency from an op by its src (see list-op-dependencies). a local dependency file stays next to the op code. the op is re-executed afterwards.",
+        { "opname": z.string(), "src": z.string(), "execute": z.boolean().optional() },
         async ({ opname, src, execute }) =>
         {
             logMcp("remove dependency " + opname + " " + src);
@@ -527,6 +541,39 @@ function registerOpFileTools(server)
             }
         }
     );
+
+}
+
+const CHANGELOG_TYPES = ["new op", "feature", "improvement", "bugfix", "deprecation"];
+const CHANGELOG_PREVIEW_LINES = 3;
+const CHANGELOG_MAX_ENTRIES = 100000;
+
+async function readOpChangelog(opname)
+{
+    const opDoc = getOpDocOrThrow(opname);
+    const res = await withTimeout(talkerSend("getOpInfo", { "opName": opDoc.id, "cl": CHANGELOG_MAX_ENTRIES, "sort": "asc" }), 10000, "getOpInfo");
+    return (res && res.changelog) || [];
+}
+
+function findChangelogEntry(entries, date)
+{
+    for (let i = 0; i < entries.length; i++)
+        if (entries[i].date === date) return entries[i];
+    return null;
+}
+
+function formatChangelog(entries)
+{
+    const lines = [];
+    for (let i = 0; i < entries.length; i++)
+    {
+        const e = entries[i];
+        let line = e.date + " " + new Date(e.date).toISOString().substring(0, 10) + " [" + (e.type || "") + "] " + e.message;
+        if (e.author) line += " (" + e.author + ")";
+        if (e.url) line += " " + e.url;
+        lines.push(line);
+    }
+    return lines.join("\n");
 }
 
 function findOpDependency(opDoc, src)
