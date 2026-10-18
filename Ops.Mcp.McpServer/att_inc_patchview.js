@@ -152,7 +152,7 @@ function registerPatchViewTools(server)
 
     server.tool(
         "move-op",
-        "reposition an existing op in the patch editor view (does not affect rendering, purely cosmetic layout); identify the op by its id and give its new x/y editor coordinates", { "opId": z.string(), "x": z.number(), "y": z.number() },
+        "reposition an existing op in the patch editor view (does not affect rendering, purely cosmetic layout); identify the op by its id and give its new x/y editor coordinates. only use it when the user asks to move an op; new ops are placed by link-ports, and tidy-up-ops arranges several.", { "opId": z.string(), "x": z.number(), "y": z.number() },
         ({ opId, x, y }) =>
         {
             logMcp("move " + opLabel(opId) + " to " + x + "," + y);
@@ -166,6 +166,7 @@ function registerPatchViewTools(server)
             const moveTo = (px, py) => { gui.patchView.patchRenderer.patchAPI.setOpUiAttribs(opId, "translate", { "x": px, "y": py }); };
 
             moveTo(x, y);
+            unplacedOpIds.delete(opId);
             CABLES.UI.undo.add(
             {
                 "title": "Move op",

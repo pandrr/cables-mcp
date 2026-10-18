@@ -188,7 +188,7 @@ function setOpCommentUndoable(opId, comment)
         });
 }
 
-// adds an op via the patch view (loads op dependencies, current subpatch) and registers undo/redo
+// adds an op via the patch view (loads op dependencies, current subpatch), which registers undo/redo
 function addOpUndoable(objName, uiAttribs)
 {
     return new Promise((resolve, reject) =>
@@ -201,20 +201,18 @@ function addOpUndoable(objName, uiAttribs)
             "onOpAdd": (newOp) =>
             {
                 clearTimeout(timeout);
-                const opId = newOp.id;
-                const attribs = JSON.parse(JSON.stringify(newOp.uiAttribs));
-
-                CABLES.UI.undo.add(
-                {
-                    "title": "Add op " + objName,
-                    "undo": () => { CABLES.patch.deleteOp(opId); },
-                    "redo": () => { CABLES.patch.addOp(objName, attribs, opId); }
-                });
-
                 resolve(newOp);
             }
         });
     });
+}
+
+// the center of the patch editor view in patch coordinates, snapped to the grid
+function patchViewCenter()
+{
+    const viewBox = gui.patchView.patchRenderer.viewBox;
+    const center = viewBox.screenToPatchCoord(viewBox.width / 2, viewBox.height / 2);
+    return { "x": snapNearest(center[0], CLEANUP_GRID_X), "y": snapNearest(center[1], CLEANUP_GRID_Y) };
 }
 
 // resolves after the next frame has been rendered completely, e.g. so a shader recompile
@@ -280,7 +278,9 @@ gui.mainTabs.on("onTabAdded", () => { if (currentServer && currentServer.isConne
 
 function buildMcpServer()
 {
-    const server = new McpServer.McpServer({ "name": "cables standalone mcp server", "version": "1.0.0" });
+    const server = new McpServer.McpServer(
+        { "name": "cables standalone mcp server", "version": "1.0.0" },
+        { "instructions": "cables patches flow from top to bottom: an op belongs below the ops linked to its inputs. when you have added and linked more than one op, call tidy-up-ops once at the end with the ids of all ops you added, instead of placing them yourself with x/y or move-op." });
     currentServer = server;
 
     // real MCP resources, for clients that browse/read via resources/list + resources/read
@@ -442,7 +442,7 @@ function buildMcpServer()
 
     server.tool(
         "link-ports",
-        "connect (link) an output port of one op to an input port of another op in the current patch; identify ops by id and ports by name (see cables://patch.json for op ids and port names)", { "opId1": z.string(), "portName1": z.string(), "opId2": z.string(), "portName2": z.string() },
+        "connect (link) an output port of one op to an input port of another op in the current patch; identify ops by id and ports by name (see cables://patch.json for op ids and port names). an op added by add-op without x/y is placed here: below the op linked to its input, or above the op it feeds, with a straight cable. undoable as one step.", { "opId1": z.string(), "portName1": z.string(), "opId2": z.string(), "portName2": z.string() },
         ({ opId1, portName1, opId2, portName2 }) =>
         {
             logMcp("link " + opLabel(opId1) + "." + portName1 + " -> " + opLabel(opId2) + "." + portName2);
@@ -457,10 +457,17 @@ function buildMcpServer()
 
             if (!op2.getPort(portName2)) return respondError("no port named \"" + portName2 + "\" on op " + opId2);
 
+            const undoGroup = CABLES.UI.undo.startGroup();
             const link = CABLES.patch.link(op1, portName1, op2, portName2);
 
             if (!link) return respondError("could not link " + opId1 + "." + portName1 + " -> " + opId2 + "." + portName2 + " (incompatible ports?)");
-            return respondText("linked " + opId1 + "." + portName1 + " -> " + opId2 + "." + portName2);
+
+            const placedOp = placeLinkedOp(link);
+            CABLES.UI.undo.endGroup(undoGroup, "Link ports");
+
+            let text = "linked " + opId1 + "." + portName1 + " -> " + opId2 + "." + portName2;
+            if (placedOp) text += "; placed " + placedOp.id + " at " + placedOp.uiAttribs.translate.x + "," + placedOp.uiAttribs.translate.y;
+            return respondText(text);
         }
     );
 
@@ -625,13 +632,17 @@ function buildMcpServer()
 
     server.tool(
         "add-op",
-        "add a new op to the current patch by its full op name (objName), e.g. Ops.Anim.Timer_v2; get valid names from search-ops. returns the new op's id (use it with link-ports / set-port-value) and its port names. optional x/y place it in the patch editor view.", { "objName": z.string(), "x": z.number().optional(), "y": z.number().optional() },
+        "add a new op to the current patch by its full op name (objName), e.g. Ops.Anim.Timer_v2; get valid names from search-ops. returns the new op's id (use it with link-ports / set-port-value) and its port names. leave x/y out: link-ports then places the op below the op linked to its input (or above the op it feeds), cables flow from top to bottom. only give x/y when the user asks for a position. when adding several ops, call tidy-up-ops with all new op ids at the end.", { "objName": z.string(), "x": z.number().optional(), "y": z.number().optional() },
         async ({ objName, x, y }) =>
         {
             logMcp("add op " + objName);
 
+            if (!gui.opDocs.getOpDocByName(objName)) return respondError("no op named \"" + objName + "\", find the name with search-ops");
+
+            const placeLater = x === undefined && y === undefined;
             const uiAttribs = {};
-            if (x !== undefined || y !== undefined) uiAttribs.translate = { "x": x || 0, "y": y || 0 };
+            if (placeLater) uiAttribs.translate = patchViewCenter();
+            else uiAttribs.translate = { "x": x || 0, "y": y || 0 };
 
             let newOp;
             try
@@ -644,6 +655,17 @@ function buildMcpServer()
             }
 
             if (!newOp) return respondError("could not add op \"" + objName + "\" (no such op? see search-ops)");
+
+            if (placeLater && gui.patchView.patchRenderer.getGlOp(newOp))
+            {
+                const rect = opRect(newOp);
+                moveToNearestFreeSpot(rect, otherOpRects(newOp, false), true, true);
+                newOp.setUiAttribs({ "translate": { "x": rect.x, "y": rect.y } });
+                unplacedOpIds.add(newOp.id);
+            }
+
+            const opDoc = gui.opDocs.getOpDocByName(objName);
+            if (opDoc && !opDoc.layout) gui.serverOps.saveOpLayout(newOp);
 
             const portsIn = newOp.portsIn.map((p) => p.name);
             const portsOut = newOp.portsOut.map((p) => p.name);
@@ -994,6 +1016,21 @@ function buildMcpServer()
     return server;
 }
 
+function readJsonBody(req)
+{
+    return new Promise((resolve, reject) =>
+    {
+        const chunks = [];
+        req.on("data", (chunk) => { chunks.push(chunk); });
+        req.on("end", () =>
+        {
+            try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); }
+            catch (e) { reject(e); }
+        });
+        req.on("error", reject);
+    });
+}
+
 const httpServer = http.createServer(async (req, res) =>
 {
     if (req.url !== "/mcp")
@@ -1012,7 +1049,24 @@ const httpServer = http.createServer(async (req, res) =>
     });
 
     await mcpServer.connect(transport);
-    await transport.handleRequest(req, res);
+
+    if (req.method != "POST")
+    {
+        await transport.handleRequest(req, res);
+        return;
+    }
+
+    let body = null;
+    try
+    {
+        body = await readJsonBody(req);
+    }
+    catch (e)
+    {
+        res.writeHead(400).end("invalid json");
+        return;
+    }
+    await transport.handleRequest(req, res, body);
 });
 
 // close() only stops accepting new connections and calls back once all open ones are gone,

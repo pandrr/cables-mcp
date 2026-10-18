@@ -565,12 +565,93 @@ function applyOpPositions(pos)
     return moved;
 }
 
+// ops added by add-op without x/y. link-ports places them next to the op they get linked to, then they count as placed
+const unplacedOpIds = new Set();
+
+// rects of the other ops in the subpatch of op that are shown in the patch editor, without the unplaced ops if skipUnplaced
+function otherOpRects(op, skipUnplaced)
+{
+    const rects = [];
+    for (const o of CABLES.patch.ops)
+    {
+        if (o == op || !o.uiAttribs.translate || (skipUnplaced && unplacedOpIds.has(o.id))) continue;
+        if ((o.uiAttribs.subPatch || 0) != (op.uiAttribs.subPatch || 0)) continue;
+        if (gui.patchView.patchRenderer.getGlOp(o)) rects.push(opRect(o));
+    }
+    return rects;
+}
+
+// moves rect left or right in grid steps to the nearest spot in its row where it is not too close to any placed rect
+function moveToFreeSpotInRow(rect, placed)
+{
+    const startX = rect.x;
+    for (let steps = 0; steps <= CLEANUP_MAX_SHIFT_STEPS; steps++)
+        for (const dirX of steps ? [1, -1] : [1])
+        {
+            rect.x = startX + dirX * steps * CLEANUP_GRID_X;
+            if (!placed.some((p) => rectsTooClose(rect, p))) return true;
+        }
+    rect.x = startX;
+    return false;
+}
+
+// moves op to x/y snapped to the grid, or the nearest free spot from there: in the same row if keepRow, otherwise also further down. undoable
+function placeOpUndoable(op, x, y, keepRow)
+{
+    const rect = opRect(op, snapNearest(x, CLEANUP_GRID_X), snapNearest(y, CLEANUP_GRID_Y));
+    const placed = otherOpRects(op, true);
+    if (!keepRow || !moveToFreeSpotInRow(rect, placed)) moveToNearestFreeSpot(rect, placed, true, false);
+    gui.patchView.setOpPos(op, rect.x, rect.y);
+}
+
+// x of the op on one end of the link so the input port is right below the output port and the cable is straight
+function straightLinkX(link, opToPlace)
+{
+    const opOut = link.portOut.op;
+    const opIn = link.portIn.op;
+    if (opToPlace == opIn) return opOut.uiAttribs.translate.x + portCenterX(opOut, link.portOut) - portCenterX(opIn, link.portIn);
+    return opIn.uiAttribs.translate.x + portCenterX(opIn, link.portIn) - portCenterX(opOut, link.portOut);
+}
+
+// places an unplaced op of a new link: the input side below all placed ops linked to its inputs, the output side above the op it feeds.
+// if both are unplaced the output side stays where it is and counts as placed. returns the placed op or null
+function placeLinkedOp(link)
+{
+    const opOut = link.portOut.op;
+    const opIn = link.portIn.op;
+
+    if (unplacedOpIds.has(opIn.id))
+    {
+        unplacedOpIds.delete(opOut.id);
+        let bottom = -Infinity;
+        for (const l of linksFromSet(opIn, new Set(CABLES.patch.ops)))
+        {
+            if (unplacedOpIds.has(l.parent.id) || !l.parent.uiAttribs.translate) continue;
+            bottom = Math.max(bottom, l.parent.uiAttribs.translate.y + opRect(l.parent).h);
+        }
+        placeOpUndoable(opIn, straightLinkX(link, opIn), bottom + CLEANUP_GAP_Y, false);
+        unplacedOpIds.delete(opIn.id);
+        return opIn;
+    }
+
+    if (unplacedOpIds.has(opOut.id))
+    {
+        const y = opIn.uiAttribs.translate.y - opRect(opOut).h - CLEANUP_GAP_Y;
+        placeOpUndoable(opOut, straightLinkX(link, opOut), y, true);
+        if (opOut.uiAttribs.translate.y + opRect(opOut).h + CLEANUP_GAP_Y > opIn.uiAttribs.translate.y)
+            placeOpUndoable(opIn, opIn.uiAttribs.translate.x, opOut.uiAttribs.translate.y + opRect(opOut).h + CLEANUP_GAP_Y, false);
+        unplacedOpIds.delete(opOut.id);
+        return opOut;
+    }
+    return null;
+}
+
 // registers the tools of this file, called by buildMcpServer
 function registerTidyUpTools(server)
 {
     server.tool(
         "tidy-up-ops",
-        "tidy up the layout of ops: arranges them in rows following their links (every op below all ops linked to its inputs), each op at the x of the op above until the links split, split children side by side in port order. ops never overlap. unselected ops are never moved, the selected ops are placed around them. links may cross. snapped to the grid. works on the selected ops, or on opIds; all have to be in the current subpatch. undoable as one step. if no valid layout is found (link cycle, no free place) nothing is changed and the reason is returned.", { "opIds": z.array(z.string()).optional(), "dryRun": z.boolean().optional() },
+        "tidy up the layout of ops, call it after adding and linking several ops, passing all new op ids: arranges them in rows following their links (every op below all ops linked to its inputs), each op at the x of the op above until the links split, split children side by side in port order. ops never overlap. unselected ops are never moved, the selected ops are placed around them. links may cross. snapped to the grid. works on the selected ops, or on opIds; all have to be in the current subpatch. undoable as one step. if no valid layout is found (link cycle, no free place) nothing is changed and the reason is returned.", { "opIds": z.array(z.string()).optional(), "dryRun": z.boolean().optional() },
         ({ opIds, dryRun }) =>
         {
             logMcp("tidy up ops");
@@ -594,6 +675,7 @@ function registerTidyUpTools(server)
             if (dryRun) return respondText([...pos].map(([o, p]) => o.id + " " + p.x + "," + p.y).join("\n"));
 
             const moved = applyOpPositions(pos);
+            for (const o of ops) unplacedOpIds.delete(o.id);
             fitPatchView(ops);
             return respondText(JSON.stringify({ "ops": ops.length, "moved": moved, "rows": new Set([...pos.values()].map((p) => p.y)).size }));
         }
