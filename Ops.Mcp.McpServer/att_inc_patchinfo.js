@@ -86,6 +86,7 @@ function patchOverviewLines(subPatch, filter, withValues)
         let head = o.id + " " + o.objName;
         if (o.getTitle() != o.objName.split(".").pop()) head += " \"" + o.getTitle() + "\"";
         if (o.uiAttribs.extendTitle) head += " (" + o.uiAttribs.extendTitle + ")";
+        if (o.uiAttribs.disabled) head += " [disabled]";
         if (opSubPatch != "0") head += " sub:" + opSubPatch;
         lines.push(head);
 
@@ -116,7 +117,7 @@ function registerPatchInfoTools(server)
 {
     server.tool(
         "get-patch-overview",
-        "compact overview of the current patch, much smaller than cables://patch.json: one line per op with its id, full op name (objName), title and subpatch, followed by its incoming (<-) and outgoing (->) links as port: opId.port. no port values unless values=true, then only the values that differ from the op's defaults (linked ports left out). optional subPatch limits it to one subpatch, filter to ops whose name or title contains the text. use get-patch-op for all values of a single op.", { "subPatch": z.string().optional(), "filter": z.string().optional(), "values": z.boolean().optional() },
+        "compact overview of the current patch, much smaller than cables://patch.json: one line per op with its id, full op name (objName), title and subpatch, followed by its incoming (<-) and outgoing (->) links as port: opId.port. no port values unless values=true, then only the values that differ from the op's defaults (linked ports left out). optional subPatch limits it to one subpatch, filter to ops whose name or title contains the text. use get-patch-op for all values of a single op. start here to find op ids.", { "subPatch": z.string().optional().describe("only list ops of this subpatch id"), "filter": z.string().optional().describe("only list ops whose op name or title contains this text"), "values": z.boolean().optional().describe("also list port values that differ from the defaults") },
         ({ subPatch, filter, values }) =>
         {
             logMcp("patch overview" + (filter ? " \"" + filter + "\"" : ""));
@@ -128,7 +129,7 @@ function registerPatchInfoTools(server)
 
     server.tool(
         "get-patch-errors",
-        "check the current patch for errors: lists ops that show ui errors/warnings (e.g. shader compile errors, missing links, wrong input types) with their messages, plus code diagnostics (line, message, code) where available. minLevel filters by severity: 0 hint, 1 warning, 2 error (default 1). optional opId checks a single op. use it after changing shader code or port values.", { "minLevel": z.number().optional(), "opId": z.string().optional() },
+        "check the current patch for errors: lists ops that show ui errors/warnings (e.g. shader compile errors, missing links, wrong input types) with their messages, plus code diagnostics (line, message, code) where available. minLevel filters by severity: 0 hint, 1 warning, 2 error (default 1). optional opId checks a single op. use it after changing shader code or port values.", { "minLevel": z.number().optional().describe("lowest severity to list: 0 hint, 1 warning, 2 error; default 1"), "opId": param.opId().optional().describe("only check this op") },
         async ({ minLevel, opId }) =>
         {
             logMcp("check patch errors" + (opId ? " of " + opLabel(opId) : ""));
@@ -145,7 +146,7 @@ function registerPatchInfoTools(server)
 
     server.tool(
         "get-patch-op",
-        "get one op instance from the current patch as serialized json, by its op id (see cables://patch.json for op ids): its current port values, uiAttribs, storage and outgoing links (incoming links are stored on the op they come from). this is the op as it is used in the patch, not its documentation (use get-op-docs for that) and not its source code (use cables://op/<name>).", { "opId": z.string() },
+        "get one op instance from the current patch as serialized json, by its op id: its current port values, uiAttribs, storage and outgoing links (incoming links are stored on the op they come from). this is the op as it is used in the patch, not its documentation (use get-op-docs for that) and not its source code (use read-op for that).", { "opId": param.opId() },
         ({ opId }) =>
         {
             logMcp("get patch op " + opLabel(opId));

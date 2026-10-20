@@ -64,7 +64,7 @@ function registerPatchViewTools(server)
 {
     server.tool(
         "patch-view",
-        "scroll/zoom the patch field (the editor's op graph, not the rendering canvas). fit=true zooms to show all ops of the current subpatch, opIds fits the view to those ops, x/y center the view on a patch coordinate (the same coordinates as op positions), zoom is half the visible width in patch units (bigger = further out). without arguments it only reports the current view. returns the visible area in patch coordinates. take a look with patch-field-screenshot.", { "fit": z.boolean().optional(), "opIds": z.array(z.string()).optional(), "x": z.number().optional(), "y": z.number().optional(), "zoom": z.number().optional() },
+        "scroll/zoom the patch field (the editor's op graph, not the rendering canvas). fit=true zooms to show all ops of the current subpatch, opIds fits the view to those ops, x/y center the view on a patch coordinate (the same coordinates as op positions), zoom is half the visible width in patch units (bigger = further out). without arguments it only reports the current view. returns the visible area in patch coordinates. take a look with patch-field-screenshot.", { "fit": z.boolean().optional().describe("zoom to show all ops of the current subpatch"), "opIds": z.array(param.opId()).optional().describe("fit the view to these ops"), "x": z.number().optional().describe("patch x coordinate to center on"), "y": z.number().optional().describe("patch y coordinate to center on"), "zoom": z.number().optional().describe("half the visible width in patch units, bigger = further out") },
         async ({ fit, opIds, x, y, zoom }) =>
         {
             logMcp("patch view");
@@ -93,7 +93,7 @@ function registerPatchViewTools(server)
 
     server.tool(
         "focus-op",
-        "scroll/zoom the patch editor view to center on an op and open its param panel, so the person looking at the editor can see it. does not affect rendering.", { "opId": z.string() },
+        "scroll/zoom the patch editor view to center on an op and open its param panel, so the person looking at the editor can see it. does not affect rendering.", { "opId": param.opId() },
         ({ opId }) =>
         {
             logMcp("focus " + opLabel(opId));
@@ -111,7 +111,7 @@ function registerPatchViewTools(server)
 
     server.tool(
         "select-op",
-        "select ops in the patch editor, like clicking them. commands from run-command act on the selected ops. opIds is a list of op ids, add true keeps the current selection, otherwise it is cleared first.", { "opIds": z.array(z.string()), "add": z.boolean().optional() },
+        "select ops in the patch editor, like clicking them. commands from run-command act on the selected ops. opIds is a list of op ids, add true keeps the current selection, otherwise it is cleared first.", { "opIds": z.array(param.opId()).describe("ids of the ops to select"), "add": z.boolean().optional().describe("keep the current selection instead of clearing it first") },
         ({ opIds, add }) =>
         {
             logMcp("select " + opIds.map((opId) => { return opLabel(opId); }).join(", "));
@@ -131,7 +131,7 @@ function registerPatchViewTools(server)
 
     server.tool(
         "bookmark-op",
-        "bookmark an op in the patch editor (like the bookmark button in its param panel) so it shows up in the bookmarks list and the command palette. bookmarked false removes the bookmark, default true. bookmarks are stored with the patch, save it afterwards.", { "opId": z.string(), "bookmarked": z.boolean().optional() },
+        "bookmark an op in the patch editor (like the bookmark button in its param panel) so it shows up in the bookmarks list and the command palette. bookmarked false removes the bookmark, default true. bookmarks are stored with the patch, save it afterwards.", { "opId": param.opId(), "bookmarked": z.boolean().optional().describe("false removes the bookmark, default true") },
         ({ opId, bookmarked }) =>
         {
             const wanted = bookmarked !== false;
@@ -152,7 +152,7 @@ function registerPatchViewTools(server)
 
     server.tool(
         "move-op",
-        "reposition an existing op in the patch editor view (does not affect rendering, purely cosmetic layout); identify the op by its id and give its new x/y editor coordinates. only use it when the user asks to move an op; new ops are placed by link-ports, and tidy-up-ops arranges several.", { "opId": z.string(), "x": z.number(), "y": z.number() },
+        "reposition an existing op in the patch editor view (does not affect rendering, purely cosmetic layout); identify the op by its id and give its new x/y editor coordinates. only use it when the user asks to move an op; new ops are placed by link-ports, and tidy-up-ops arranges several.", { "opId": param.opId(), "x": z.number().describe("new patch x coordinate"), "y": z.number().describe("new patch y coordinate") },
         ({ opId, x, y }) =>
         {
             logMcp("move " + opLabel(opId) + " to " + x + "," + y);

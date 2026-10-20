@@ -83,6 +83,48 @@ function childOpsInSet(op, set)
     return children;
 }
 
+// the ops on a link path from op back to op, starting and ending with op, or null if op is not part of a cycle
+function cycleThrough(op, set)
+{
+    const previous = new Map();
+    const todo = [];
+    for (const child of childOpsInSet(op, set))
+    {
+        previous.set(child, op);
+        todo.push(child);
+    }
+
+    while (todo.length)
+    {
+        const o = todo.shift();
+        if (o == op)
+        {
+            const path = [op];
+            for (let p = previous.get(op); p != op; p = previous.get(p)) path.unshift(p);
+            path.unshift(op);
+            return path;
+        }
+        for (const child of childOpsInSet(o, set))
+        {
+            if (previous.has(child)) continue;
+            previous.set(child, o);
+            todo.push(child);
+        }
+    }
+    return null;
+}
+
+// "a -> b -> a" for the first cycle found among the ops, or "" if there is none
+function describeCycle(ops, set)
+{
+    for (const o of ops)
+    {
+        const cycle = cycleThrough(o, set);
+        if (cycle) return cycle.map((c) => c.id).join(" -> ");
+    }
+    return "";
+}
+
 // connected ops as close as possible: every op with children moves down to the row right above its highest child
 function pullDownToChildren(ops, set, layer, sideChains)
 {
@@ -454,7 +496,7 @@ function layoutGroup(ops)
         layers = layerOps(ops, set, sideChains);
     }
     sideChainTops = new Set(sideChains.keys());
-    if (!layers) return "the links between the ops form a cycle";
+    if (!layers) return "the links between the ops form a cycle: " + describeCycle(ops, set) + ", unlink one of them";
 
     const startY = snapNearest(Math.min(...ops.map((o) => o.uiAttribs.translate.y)), CLEANUP_GRID_Y);
     const firstPos = placeOps(layers, set, startY, new Map(), sideChains, new Map());
@@ -651,7 +693,7 @@ function registerTidyUpTools(server)
 {
     server.tool(
         "tidy-up-ops",
-        "tidy up the layout of ops, call it after adding and linking several ops, passing all new op ids: arranges them in rows following their links (every op below all ops linked to its inputs), each op at the x of the op above until the links split, split children side by side in port order. ops never overlap. unselected ops are never moved, the selected ops are placed around them. links may cross. snapped to the grid. works on the selected ops, or on opIds; all have to be in the current subpatch. undoable as one step. if no valid layout is found (link cycle, no free place) nothing is changed and the reason is returned.", { "opIds": z.array(z.string()).optional(), "dryRun": z.boolean().optional() },
+        "tidy up the layout of ops, call it after adding and linking several ops, passing all new op ids: arranges them in rows following their links (every op below all ops linked to its inputs), each op at the x of the op above until the links split, split children side by side in port order. ops never overlap. unselected ops are never moved, the selected ops are placed around them. links may cross. snapped to the grid. works on the selected ops, or on opIds; all have to be in the current subpatch. undoable as one step. if no valid layout is found (link cycle, no free place) nothing is changed and the reason is returned.", { "opIds": z.array(param.opId()).optional().describe("ids of the ops to arrange, usually all ops you just added; without it the selected ops are used"), "dryRun": z.boolean().optional().describe("only report the new positions, do not move anything") },
         ({ opIds, dryRun }) =>
         {
             logMcp("tidy up ops");

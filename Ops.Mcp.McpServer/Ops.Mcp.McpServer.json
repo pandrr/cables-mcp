@@ -28,6 +28,10 @@
             {
                 "type": 5,
                 "name": "Log"
+            },
+            {
+                "type": 2,
+                "name": "Stats"
             }
         ]
     }

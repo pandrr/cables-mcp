@@ -270,12 +270,18 @@ function freePastePosition()
 // registers the tools of this file, called by buildMcpServer
 function registerPatchJsonTools(server)
 {
-    const loadPatchParams = { "clear": z.boolean().optional(), "x": z.number().optional(), "y": z.number().optional(), "server": z.string().optional(), "assetServer": z.string().optional() };
+    const loadPatchParams = {
+        "clear": z.boolean().optional().describe("delete the current ops first"),
+        "x": z.number().optional().describe("patch x position to paste at"),
+        "y": z.number().optional().describe("patch y position to paste at"),
+        "server": z.string().optional().describe("cables server url, default the live server"),
+        "assetServer": z.string().optional().describe("server to load the patch assets from")
+    };
     const loadPatchDescription = "file ports pointing at /assets/... (project and library files) are rewritten to load from https://devsandbox.cables.gl/assets/... (assetServer changes that url). clear=true deletes all ops first, except the mcp server op and the ops linked to it. x/y place the ops, by default right of the existing ops. undoable. ops that are not available locally (e.g. user or patch ops) are left out and reported.";
 
     server.tool(
         "load-patch-json",
-        "download a public patch from the live cables server and add its ops to the current subpatch, like pasting them. project is the patch id, short id or url (https://cables.gl/p/<id>). " + loadPatchDescription, { "project": z.string(), ...loadPatchParams },
+        "download a public patch from the live cables server and add its ops to the current subpatch, like pasting them. project is the patch id, short id or url (https://cables.gl/p/<id>). " + loadPatchDescription, { "project": z.string().describe("patch id, short id or url like https://cables.gl/p/<id>"), ...loadPatchParams },
         async (params) =>
         {
             const patchId = parsePatchId(params.project);
@@ -286,7 +292,7 @@ function registerPatchJsonTools(server)
 
     server.tool(
         "load-example-patch",
-        "load the example patch of an op by its full op name (e.g. Ops.Gl.Texture_v3) from the live cables server and add its ops to the current subpatch, like pasting them. if the op has no example patch, the example of its newest older version that has one is used. " + loadPatchDescription, { "opname": z.string(), ...loadPatchParams },
+        "load the example patch of an op by its full op name (e.g. Ops.Gl.Texture_v3) from the live cables server and add its ops to the current subpatch, like pasting them. if the op has no example patch, the example of its newest older version that has one is used. " + loadPatchDescription, { "opname": param.opName(), ...loadPatchParams },
         async (params) =>
         {
             logMcp("example " + params.opname);
@@ -305,7 +311,7 @@ function registerPatchJsonTools(server)
 
     server.tool(
         "upgrade-ops",
-        "replace ops with the newest version of their op, the same as the editor's \"Upgrade selected ops\" command: port values, links and position are copied, the op gets a new id. opIds are op ids in the current patch, all=true upgrades every outdated op in the patch instead. ops that are already the newest version are skipped. reports links that are lost because the new version does not have that port.", { "opIds": z.array(z.string()).optional(), "all": z.boolean().optional() },
+        "replace ops with the newest version of their op, the same as the editor's \"Upgrade selected ops\" command: port values, links and position are copied, the op gets a new id. opIds are op ids in the current patch, all=true upgrades every outdated op in the patch instead. ops that are already the newest version are skipped. reports links that are lost because the new version does not have that port.", { "opIds": z.array(param.opId()).optional().describe("ids of the ops to upgrade"), "all": z.boolean().optional().describe("upgrade every outdated op in the patch instead of opIds") },
         async ({ opIds, all }) =>
         {
             let ids = opIds || [];
@@ -323,7 +329,7 @@ function registerPatchJsonTools(server)
 
     server.tool(
         "downgrade-ops",
-        "replace ops with the previous version of their op (e.g. Ops.Gl.Texture_v3 -> Ops.Gl.Texture_v2), the same as the editor's \"Downgrade selected op\" command: port values, links and position are copied, the op gets a new id. ops without a previous version are skipped. reports links that are lost because the old version does not have that port.", { "opIds": z.array(z.string()) },
+        "replace ops with the previous version of their op (e.g. Ops.Gl.Texture_v3 -> Ops.Gl.Texture_v2), the same as the editor's \"Downgrade selected op\" command: port values, links and position are copied, the op gets a new id. ops without a previous version are skipped. reports links that are lost because the old version does not have that port.", { "opIds": z.array(param.opId()).describe("ids of the ops to downgrade") },
         async ({ opIds }) =>
         {
             return respondText(await replaceOpVersions(opIds, getPreviousVersionName, "has no previous version", "downgrade"));

@@ -109,7 +109,7 @@ function registerAnimTools(server)
 {
     server.tool(
         "timeline",
-        "control the timeline: play (true plays, false pauses) and time (jump to a time in seconds). viewStart/viewLength scroll/zoom the timeline panel so it shows viewLength seconds starting at viewStart (animated, the reported view is from before the change). without arguments it only reports the current time, whether it is playing and, if the timeline panel is open, its view. animated ports and Ops.TimeLine.* ops follow this time.", { "play": z.boolean().optional(), "time": z.number().optional(), "viewStart": z.number().optional(), "viewLength": z.number().optional() },
+        "control the timeline: play (true plays, false pauses) and time (jump to a time in seconds). viewStart/viewLength scroll/zoom the timeline panel so it shows viewLength seconds starting at viewStart (animated, the reported view is from before the change). without arguments it only reports the current time, whether it is playing and, if the timeline panel is open, its view. animated ports and Ops.TimeLine.* ops follow this time.", { "play": z.boolean().optional().describe("true plays, false pauses"), "time": z.number().optional().describe("jump to this time in seconds"), "viewStart": z.number().optional().describe("timeline panel: first visible second"), "viewLength": z.number().optional().describe("timeline panel: number of visible seconds") },
         ({ play, time, viewStart, viewLength }) =>
         {
             const timer = CABLES.patch.timer;
@@ -135,7 +135,7 @@ function registerAnimTools(server)
 
     server.tool(
         "set-port-animated",
-        "make a number input port animated (keyframed by the timeline) or not animated anymore. a newly animated port gets a first keyframe with its current value at the current timeline time. undoable. the same way Ops.TimeLine.Anim has an animated \"Value\" port whose anim can be reused by linking its \"Anim\" output to several Ops.TimeLine.AnimGetValue ops.", { "opId": z.string(), "portName": z.string(), "animated": z.boolean() },
+        "make a number input port animated (keyframed by the timeline) or not animated anymore. a newly animated port gets a first keyframe with its current value at the current timeline time. undoable. the same way Ops.TimeLine.Anim has an animated \"Value\" port whose anim can be reused by linking its \"Anim\" output to several Ops.TimeLine.AnimGetValue ops.", { "opId": param.opId(), "portName": param.portName(), "animated": z.boolean().describe("true makes it animated, false removes the animation") },
         ({ opId, portName, animated }) =>
         {
             logMcp((animated ? "animate " : "unanimate ") + opLabel(opId) + "." + portName);
@@ -152,7 +152,7 @@ function registerAnimTools(server)
 
     server.tool(
         "get-anim",
-        "get the animation of a port: whether it is animated, its keyframes (time in seconds, value, easing), loop mode, length (time of the last keyframe), the current timeline time and the value at that time.", { "opId": z.string(), "portName": z.string() },
+        "get the animation of a port: whether it is animated, its keyframes (time in seconds, value, easing), loop mode, length (time of the last keyframe), the current timeline time and the value at that time.", { "opId": param.opId(), "portName": param.portName() },
         ({ opId, portName }) =>
         {
             logMcp("get anim " + opLabel(opId) + "." + portName);
@@ -168,11 +168,11 @@ function registerAnimTools(server)
         "set-keyframes",
         "add or change keyframes of a number input port, the port is made animated if it is not yet. keys is a list of { time (seconds), value, easing (optional) }, a key at an existing time replaces it. easing is the curve from this key to the next one, one of: " + easingNames().join(", ") + " (default linear). clear=true removes all existing keys first. loop sets the loop mode after the last key: off, repeat, mirror or offset. undoable as one step.",
         {
-            "opId": z.string(),
-            "portName": z.string(),
-            "keys": z.array(z.object({ "time": z.number(), "value": z.number(), "easing": z.string().optional() })),
-            "clear": z.boolean().optional(),
-            "loop": z.enum(["off", "repeat", "mirror", "offset"]).optional()
+            "opId": param.opId(),
+            "portName": param.portName(),
+            "keys": z.array(z.object({ "time": z.number().describe("time in seconds"), "value": z.number(), "easing": z.string().optional().describe("curve to the next key, default linear") })).describe("keyframes, e.g. [{ \"time\": 0, \"value\": 0 }, { \"time\": 2, \"value\": 1 }]"),
+            "clear": z.boolean().optional().describe("remove all existing keys first"),
+            "loop": z.enum(["off", "repeat", "mirror", "offset"]).optional().describe("what happens after the last key")
         },
         ({ opId, portName, keys, clear, loop }) =>
         {
@@ -206,7 +206,7 @@ function registerAnimTools(server)
 
     server.tool(
         "delete-keyframes",
-        "delete keyframes of an animated port by their times in seconds (see get-anim). an animation needs at least one key, to remove the whole animation use set-port-animated with animated=false. undoable as one step.", { "opId": z.string(), "portName": z.string(), "times": z.array(z.number()) },
+        "delete keyframes of an animated port by their times in seconds (see get-anim). an animation needs at least one key, to remove the whole animation use set-port-animated with animated=false. undoable as one step.", { "opId": param.opId(), "portName": param.portName(), "times": z.array(z.number()).describe("times in seconds of the keys to delete, as listed by get-anim") },
         ({ opId, portName, times }) =>
         {
             logMcp("delete " + times.length + " keyframes " + opLabel(opId) + "." + portName);

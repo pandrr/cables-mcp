@@ -122,7 +122,7 @@ function registerConsoleTools(server)
 {
     server.tool(
         "get-console-logs",
-        "read the editor's console: console.log/warn/error, uncaught exceptions and browser messages like the yellow webgl warnings (GL_INVALID_OPERATION...). needs electron started with --remote-debugging-port=9222. minLevel: verbose, info, warning or error (default info). optional str filters by text, limit is the number of newest entries (default 100), clear empties the list afterwards.", { "minLevel": z.enum(CONSOLE_LEVELS).optional(), "str": z.string().optional(), "limit": z.number().optional(), "clear": z.boolean().optional() },
+        "read the editor's console: console.log/warn/error, uncaught exceptions and browser messages like the yellow webgl warnings (GL_INVALID_OPERATION...). needs electron started with --remote-debugging-port=9222. minLevel: verbose, info, warning or error (default info). optional str filters by text, limit is the number of newest entries (default 100), clear empties the list afterwards.", { "minLevel": z.enum(CONSOLE_LEVELS).optional().describe("lowest level to list, default info; \"error\" for errors only"), "str": z.string().optional().describe("only list entries containing this text"), "limit": param.limit(CONSOLE_DEFAULT_LIMIT), "clear": z.boolean().optional().describe("empty the list afterwards, so the next call only shows new entries") },
         async ({ minLevel, str, limit, clear }) =>
         {
             logMcp("get console logs" + (str ? " \"" + str + "\"" : ""));

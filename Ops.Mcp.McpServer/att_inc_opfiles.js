@@ -87,6 +87,61 @@ async function createOp(opname, code, attachments)
     return created;
 }
 
+// editor messages can contain links like <a href="/op/...">name</a>, only their text is useful in a tool result
+function stripHtml(text)
+{
+    return String(text).replace(/<[^>]+>/g, "");
+}
+
+// resolves once the op docs know an op with this name, e.g. after a rename was loaded in the background
+function waitForOpDoc(opname, timeoutMs)
+{
+    return new Promise((resolve, reject) =>
+    {
+        const start = Date.now();
+        const check = () =>
+        {
+            if (gui.opDocs.getOpDocByName(opname)) resolve();
+            else if (Date.now() - start > timeoutMs) reject(new Error("timeout waiting for " + opname + " to load"));
+            else setTimeout(check, OP_DOC_POLL_MS);
+        };
+        check();
+    });
+}
+
+// renames an op with the editor's rename (electron only), all its instances in the patch are replaced
+async function renameOp(oldName, newName)
+{
+    getOpDocOrThrow(oldName);
+    if (gui.opDocs.getOpDocByName(newName)) throw new Error("op " + newName + " already exists");
+
+    await withTimeout(new Promise((resolve, reject) =>
+    {
+        gui.serverOps.rename(oldName, newName, (err) => { if (err) reject(new Error(stripHtml(err))); else resolve(); });
+    }), 15000, "rename");
+
+    await waitForOpDoc(newName, 15000);
+}
+
+// clones an op to a new name (any namespace the platform allows, e.g. a new version Ops.X_v2), optionally replacing its instances in the patch
+async function cloneOp(opname, newName, replaceInPatch)
+{
+    const opDoc = getOpDocOrThrow(opname);
+    if (gui.opDocs.getOpDocByName(newName)) throw new Error("op " + newName + " already exists");
+
+    await withTimeout(new Promise((resolve, reject) =>
+    {
+        gui.serverOps.clone(opDoc.id, newName, resolve, { "openEditor": false, "onError": (msg) => { reject(new Error(msg)); } });
+    }), 15000, "clone");
+
+    await withTimeout(new Promise((resolve) => { gui.serverOps.loadOpDependencies(newName, resolve); }), 15000, "loadOpDependencies");
+
+    if (!replaceInPatch) return 0;
+    const ops = gui.corePatch().getOpsByObjName(opname);
+    for (let i = 0; i < ops.length; i++) gui.patchView.replaceOp(ops[i].id, newName);
+    return ops.length;
+}
+
 // saves new op code like the op code editor does, also updates the op's editor tab if it is open
 // so saving that tab later does not bring back the old code
 async function saveOpCode(opname, code)
@@ -218,7 +273,7 @@ function registerOpFileTools(server)
     server.tool(
         "read-op",
         "read the code of an op (or one of its attachments, att_ prefix optional) with line numbers, much cheaper than reading the whole file: fromLine/toLine limit it to a range of lines, find only lists the lines containing that text, without attachment it also searches the op's include attachments (att_inc_*.js) and prefixes each line with its file name. use edit-op-text to change it.",
-        { "opname": z.string(), "attachment": z.string().optional(), "fromLine": z.number().optional(), "toLine": z.number().optional(), "find": z.string().optional() },
+        { "opname": param.opName(), "attachment": z.string().optional().describe("attachment file instead of the op code, e.g. att_inc_utils.js (see list-op-attachments)"), "fromLine": z.number().optional().describe("first line to read, 1 based"), "toLine": z.number().optional().describe("last line to read"), "find": z.string().optional().describe("only list the lines containing this text") },
         async ({ opname, attachment, fromLine, toLine, find }) =>
         {
             logMcp("read op " + opname + (attachment ? "/" + attachmentFileName(attachment) : ""));
@@ -251,7 +306,7 @@ function registerOpFileTools(server)
     server.tool(
         "edit-op-text",
         "change the code of an op (or one of its attachments, att_ prefix optional) by replacing oldText with newText, without sending the whole file. oldText has to match exactly once (copy it from read-op without the line numbers, include enough surrounding lines to make it unique), or pass replaceAll=true to replace every occurrence. the op is saved and re-executed afterwards.",
-        { "opname": z.string(), "attachment": z.string().optional(), "oldText": z.string(), "newText": z.string(), "replaceAll": z.boolean().optional() },
+        { "opname": param.opName(), "attachment": z.string().optional().describe("attachment file instead of the op code, e.g. att_inc_utils.js (see list-op-attachments)"), "oldText": z.string().describe("exact text to replace, copied from read-op without the line numbers, with enough lines to be unique"), "newText": z.string().describe("the replacement text"), "replaceAll": z.boolean().optional().describe("replace every occurrence instead of requiring exactly one") },
         async ({ opname, attachment, oldText, newText, replaceAll }) =>
         {
             logMcp("edit op " + opname + (attachment ? "/" + attachmentFileName(attachment) : ""));
@@ -276,8 +331,8 @@ function registerOpFileTools(server)
 
     server.tool(
         "edit-op",
-        "open an op to edit and change it",
-        { "opname": z.string() },
+        "open the code of an op in an editor tab, so the person at the editor sees it (it then shows up in list-resources). to read or change code you do not need this: use read-op and edit-op-text.",
+        { "opname": param.opName() },
         (opts) =>
         {
             logMcp("edit op " + opts.opname);
@@ -288,8 +343,8 @@ function registerOpFileTools(server)
 
     server.tool(
         "write-opened-resources",
-        "change/write content of an opened file",
-        { "uri": z.string(), "text": z.string() },
+        "replace the whole content of a file that is open in an editor tab (see list-resources) and save it. for op code prefer edit-op-text, it only sends the changed part and needs no open tab.",
+        { "uri": z.string().describe("mcpfile:///<name> uri from list-resources"), "text": z.string().describe("the complete new file content") },
         ({ uri, text }) =>
         {
             logMcp("write file " + uriLabel(uri));
@@ -307,8 +362,8 @@ function registerOpFileTools(server)
 
     server.tool(
         "create-op",
-        "create a new op by its full name, which has to start with Ops.Local. (e.g. Ops.Local.Sdf.Sphere, other namespaces are rejected), optionally with its code and attachments as { \"att_name\": content } (att_ prefix optional). add it to the patch with add-op afterwards.",
-        { "opname": z.string(), "code": z.string().optional(), "attachments": z.record(z.string()).optional() },
+        "create a new op by its full name, which has to start with Ops.Local. (e.g. Ops.Local.Sdf.Sphere, other namespaces are rejected), optionally with its code and attachments as { \"att_name\": content } (att_ prefix optional). add it to the patch with add-op afterwards. to put it in another namespace, use rename-op afterwards.",
+        { "opname": param.opName().describe("full name of the new op, has to start with Ops.Local., e.g. Ops.Local.MyOp"), "code": z.string().optional().describe("op javascript code, e.g. const inExec = op.inTrigger(\"Exec\");"), "attachments": z.record(z.string()).optional().describe("attachment files as { \"att_name\": content }") },
         async ({ opname, code, attachments }) =>
         {
             logMcp("create op " + opname);
@@ -328,9 +383,72 @@ function registerOpFileTools(server)
     );
 
     server.tool(
+        "rename-op",
+        "rename an op (its files, docs and changelog) from oldName to newName, both full names, e.g. Ops.Local.MyOp to Ops.Extension.Canvas2d.MyOp; can move it to another namespace. all instances in the patch are replaced. electron only. the editor checks the new name and returns its problems (name taken, invalid namespace...).",
+        { "oldName": param.opName().describe("current full op name"), "newName": param.opName().describe("new full op name, e.g. Ops.Extension.Canvas2d.MyOp") },
+        async ({ oldName, newName }) =>
+        {
+            logMcp("rename op " + oldName + " -> " + newName);
+
+            try
+            {
+                await renameOp(oldName, newName);
+                return respondText("renamed " + oldName + " to " + newName);
+            }
+            catch (e)
+            {
+                return respondError("could not rename op: " + e.message);
+            }
+        }
+    );
+
+    server.tool(
+        "set-op-summary",
+        "set the one line summary of an op (shown in op search and docs), by full op name. the same as the editor's \"Set op summary\" command. keep it short, like \"Draws a rectangle on a canvas2d\".",
+        { "opname": param.opName(), "summary": z.string().describe("the new one line summary") },
+        async ({ opname, summary }) =>
+        {
+            logMcp("set summary " + opname);
+
+            try
+            {
+                const opDoc = getOpDocOrThrow(opname);
+                await talkerSend("opSetSummary", { "opId": opDoc.id, "summary": summary });
+                opDoc.summary = summary;
+                gui.opSelect().reload();
+                return respondText("set summary of " + opname + ": " + summary);
+            }
+            catch (e)
+            {
+                return respondError("could not set summary: " + e.message);
+            }
+        }
+    );
+
+    server.tool(
+        "clone-op",
+        "copy an op (code and attachments) to a new full op name, which can be in another namespace or a new version (e.g. Ops.Gl.Foo -> Ops.Gl.Foo_v2). replaceInPatch replaces all instances of the old op in the patch with the clone. returns how many were replaced.",
+        { "opname": param.opName().describe("full name of the op to copy"), "newName": param.opName().describe("full name of the copy, e.g. Ops.Gl.Foo_v2"), "replaceInPatch": z.boolean().optional().describe("replace all instances of the old op in the patch with the copy, default false") },
+        async ({ opname, newName, replaceInPatch }) =>
+        {
+            logMcp("clone op " + opname + " -> " + newName);
+
+            try
+            {
+                const replaced = await cloneOp(opname, newName, replaceInPatch);
+                return respondText("cloned " + opname + " to " + newName + (replaceInPatch ? ", replaced " + replaced + " instances in the patch" : ""));
+            }
+            catch (e)
+            {
+                return respondError("could not clone op: " + e.message);
+            }
+        }
+    );
+
+    server.tool(
         "list-op-attachments",
         "list the attachment files of an op (e.g. att_inc_node.js, att_shader.vert), by full op name. read them with read-op-attachment, change them with write-op-attachment.",
-        { "opname": z.string() },
+        { "opname": param.opName() },
         ({ opname }) =>
         {
             logMcp("list attachments " + opname);
@@ -346,7 +464,7 @@ function registerOpFileTools(server)
     server.tool(
         "read-op-attachment",
         "read the content of an op attachment file by full op name and attachment name (e.g. att_inc_node.js, the att_ prefix is optional); see list-op-attachments",
-        { "opname": z.string(), "name": z.string() },
+        { "opname": param.opName(), "name": z.string().describe("attachment file name, e.g. att_inc_utils.js") },
         async ({ opname, name }) =>
         {
             logMcp("read attachment " + opname + "/" + attachmentFileName(name));
@@ -365,7 +483,7 @@ function registerOpFileTools(server)
     server.tool(
         "write-op-attachment",
         "write the full content of an op attachment file (the att_ prefix is optional), creating it if the op does not have it yet. att_inc_*.js files are included into the op code, other attachments are available in the op as attachments.<name> (dots replaced by _). by default the op is re-executed afterwards so all instances in the patch use the new code; pass execute=false when writing several attachments and only execute on the last one.",
-        { "opname": z.string(), "name": z.string(), "content": z.string(), "execute": z.boolean().optional() },
+        { "opname": param.opName(), "name": z.string().describe("attachment file name, e.g. att_inc_utils.js or att_shader.frag"), "content": z.string().describe("the complete file content"), "execute": z.boolean().optional().describe("re-execute the op afterwards, default true; false when writing several files, then true on the last one") },
         async ({ opname, name, content, execute }) =>
         {
             logMcp("write attachment " + opname + "/" + attachmentFileName(name));
@@ -387,7 +505,7 @@ function registerOpFileTools(server)
     server.tool(
         "delete-op-attachment",
         "delete an attachment file of an op by full op name and attachment name (the att_ prefix is optional), see list-op-attachments. by default the op is re-executed afterwards so all instances in the patch use the code without it; pass execute=false when deleting several attachments and only execute on the last one.",
-        { "opname": z.string(), "name": z.string(), "execute": z.boolean().optional() },
+        { "opname": param.opName(), "name": z.string().describe("attachment file name, e.g. att_inc_utils.js"), "execute": z.boolean().optional().describe("re-execute the op afterwards, default true") },
         async ({ opname, name, execute }) =>
         {
             const fileName = attachmentFileName(name);
@@ -415,7 +533,7 @@ function registerOpFileTools(server)
     server.tool(
         "read-op-dependency",
         "read the content of a local dependency file of an op (e.g. ./lib.js from the op's dependencies, see get-op-docs). fromLine/toLine limit it to a range of lines, find only lists the lines containing that text.",
-        { "opname": z.string(), "name": z.string(), "fromLine": z.number().optional(), "toLine": z.number().optional(), "find": z.string().optional() },
+        { "opname": param.opName(), "name": z.string().describe("dependency file name, e.g. lib.js"), "fromLine": z.number().optional().describe("first line to read, 1 based"), "toLine": z.number().optional().describe("last line to read"), "find": z.string().optional().describe("only list the lines containing this text") },
         async ({ opname, name, fromLine, toLine, find }) =>
         {
             logMcp("read dependency " + opname + "/" + name);
@@ -444,7 +562,7 @@ function registerOpFileTools(server)
     server.tool(
         "write-op-dependency",
         "write the full content of a local dependency file of an op (name like lib.js, stored next to the op code) and add it to the op's dependencies if it is not listed yet. type is commonjs (default, loaded as a script) or module (es module, then export names the global it is made available as). the op is re-executed afterwards; an already loaded library may need an editor reload to pick up changed code.",
-        { "opname": z.string(), "name": z.string(), "content": z.string(), "type": z.enum(["commonjs", "module"]).optional(), "export": z.string().optional(), "execute": z.boolean().optional() },
+        { "opname": param.opName(), "name": z.string().describe("dependency file name, e.g. lib.js"), "content": z.string().describe("the complete file content"), "type": z.enum(["commonjs", "module"]).optional().describe("commonjs (default, loaded as a script) or module (es module)"), "export": z.string().optional().describe("module only: name of the global the module is available as"), "execute": z.boolean().optional().describe("re-execute the op afterwards, default true") },
         async ({ opname, name, content, type, "export": exportName, execute }) =>
         {
             logMcp("write dependency " + opname + "/" + name);
@@ -466,7 +584,7 @@ function registerOpFileTools(server)
     server.tool(
         "list-op-dependencies",
         "list the dependencies of an op (src, type, export) and the dependency types this platform supports",
-        { "opname": z.string() },
+        { "opname": param.opName() },
         async ({ opname }) =>
         {
             logMcp("list dependencies " + opname);
@@ -486,7 +604,7 @@ function registerOpFileTools(server)
     server.tool(
         "add-op-dependency",
         "add a dependency to an op, or change type/export of an existing one with the same src. src is a url (lib/commonjs/module), a local file like ./lib.js (see write-op-dependency), an npm package name like three@0.160.0 (npm), a corelib name (corelib) or an op name (op). export names the global an es module (type module) is made available as. the dependencies are loaded and the op is re-executed afterwards.",
-        { "opname": z.string(), "src": z.string(), "type": z.string(), "export": z.string().optional(), "execute": z.boolean().optional() },
+        { "opname": param.opName(), "src": z.string().describe("url, ./local.js, npm package like three@0.160.0, corelib name or op name"), "type": z.string().describe("dependency type, see list-op-dependencies for the supported ones, e.g. npm or module"), "export": z.string().optional().describe("module only: name of the global the module is available as"), "execute": z.boolean().optional().describe("re-execute the op afterwards, default true") },
         async ({ opname, src, type, "export": exportName, execute }) =>
         {
             logMcp("add dependency " + opname + " " + src);
@@ -519,7 +637,7 @@ function registerOpFileTools(server)
     server.tool(
         "remove-op-dependency",
         "remove a dependency from an op by its src (see list-op-dependencies). a local dependency file stays next to the op code. the op is re-executed afterwards.",
-        { "opname": z.string(), "src": z.string(), "execute": z.boolean().optional() },
+        { "opname": param.opName(), "src": z.string().describe("src of the dependency, as listed by list-op-dependencies"), "execute": z.boolean().optional().describe("re-execute the op afterwards, default true") },
         async ({ opname, src, execute }) =>
         {
             logMcp("remove dependency " + opname + " " + src);
