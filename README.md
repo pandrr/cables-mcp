@@ -15,7 +15,9 @@ cables mcp server as an operator. this enables communication of an llm/ai with t
 - start cables standalone (min v0.11.1 or self build)
 - add folder of this repository as an op dir
 - you should be able to use McpServer op now, add it to your patch
-- the op output `Started` shows if the server is running, `Log` shows the latest requests
+- the op output `Started` shows if the server is running, `Log` shows the latest request
+- the op title shows how often it was called (e.g. "called 12x"), so you can see that a client is still connected
+- the op output `Stats` is an object with the number of calls per tool, the total, the last tool and when it was called, e.g. link it to `Ops.Ui.VizObject`. the counts are kept until the editor reloads
 - open op code editor by pressing [e] and then you should be able to chat about this code
 
 ### add mcp server to terminal claude code
@@ -75,6 +77,7 @@ some clients don't expose resources to the ai, so they can also be used with the
 | `link-ports` | link an output port to an input port |
 | `unlink-ports` | remove a link |
 | `set-op-comment` | set the comment of an op |
+| `set-op-enabled` | enable or disable ops, like pressing "d" |
 | `save-patch` | save the patch (like ctrl+s) |
 | `set-patch-name` | rename the patch |
 | `upload-file` | upload a file into the patch's asset folder, from a url or base64 content |
@@ -89,7 +92,11 @@ some clients don't expose resources to the ai, so they can also be used with the
 | `load-patch-json` | download a public patch by id, short id or url and add its ops to the current subpatch, like pasting them |
 | `load-example-patch` | the same with the example patch of an op, by op name (falls back to the example of an older version) |
 
+| `upload-patch` | upload the current patch json (ops and ui, no op code or assets) to cables.gl as a new private patch, or overwrite one with `projectId`; `server` picks another server, e.g. `https://dev.cables.gl` |
+
 file ports pointing at `/assets/...` are rewritten to load from `https://devsandbox.cables.gl/assets/...`. ops that are not available locally (e.g. user or patch ops) are left out and reported. `clear` deletes all ops first, like `clear-patch`.
+
+`upload-patch` needs a cables.gl api key, entered in the standalone preferences ("cables.gl API key"). unsaved changes are saved first. it fails when the patch uses `Ops.Local` ops, they do not exist on the server. only the patch is uploaded: ops that the server does not have (new or changed team/user ops) have to be published there separately.
 
 ### patch editor view
 
@@ -99,6 +106,7 @@ file ports pointing at `/assets/...` are rewritten to load from `https://devsand
 | `patch-field-screenshot` | screenshot of the patch field (ops and links) |
 | `focus-op` | center an op and open its param panel, so you can see what the ai is talking about |
 | `select-op` | select ops, like clicking them |
+| `bookmark-op` | bookmark an op or remove its bookmark (stored with the patch) |
 | `move-op` | move an op in the patch field |
 | `tidy-up-ops` | arrange the selected ops in rows following their links (undoable) |
 | `timeline-screenshot` | screenshot of the timeline panel |
@@ -121,6 +129,7 @@ an animation can be reused: animate the `Value` port of `Ops.TimeLine.Anim` and 
 |---|---|
 | `screenshot` | screenshot of the rendering canvas |
 | `set-canvas-size` | set the size of the rendering canvas |
+| `inspect-element-port` | the html element in an object port: canvas, image, video and image bitmaps as png, other elements as tag, style, rect and html |
 
 ### op code
 
@@ -131,13 +140,21 @@ an animation can be reused: animate the `Value` port of `Ops.TimeLine.Anim` and 
 | `get-op-docs` | docs of an op: summary, description, ports, dependencies, newer versions |
 | `read-op` | read op code with line numbers, or a range of lines, or only lines containing a text (also searches the op's `att_inc_*.js` includes, with file names) |
 | `edit-op-text` | change op code by replacing a text, the op is saved and re-executed |
-| `edit-op` | open an op in the code editor and change it |
-| `create-op` | create a new op, optionally with code and attachments |
+| `edit-op` | open an op in a code editor tab, so the person at the editor sees it |
+| `create-op` | create a new op (only `Ops.Local.*`), optionally with code and attachments |
+| `rename-op` | rename an op or move it to another namespace, its instances in the patch are replaced (standalone only) |
+| `clone-op` | copy an op to a new name or a new version (e.g. `_v2`), optionally replacing it in the patch |
+| `set-op-summary` | set the one line summary of an op |
 | `list-op-attachments` | list the attachment files of an op |
 | `read-op-attachment` | read an attachment |
 | `write-op-attachment` | write or create an attachment |
 | `delete-op-attachment` | delete an attachment |
 | `write-opened-resources` | write a file that is opened in the code editor |
+| `list-op-dependencies` | dependencies of an op and the dependency types the platform supports |
+| `add-op-dependency` | add a dependency: url, local file, npm package, corelib or op |
+| `remove-op-dependency` | remove a dependency |
+| `read-op-dependency` | read a local dependency file, e.g. `./lib.js` |
+| `write-op-dependency` | write a local dependency file and add it to the dependencies |
 
 ### editor
 
@@ -150,6 +167,7 @@ an animation can be reused: animate the `Value` port of `Ops.TimeLine.Anim` and 
 | `get-build-info` | when the running ui and core were built and from which commit, to check a change is live |
 | `reload-editor` | reload the editor page, optionally saving or discarding unsaved changes |
 | `perf-profiler-read` | per frame durations and counts of the patch's perf profiler |
+| `patch-profiler-read` | the most expensive ops of the running patch, like the Patch Profiler tab |
 | `ui-profiler-start` / `ui-profiler-read` | measure the editor's own ui code |
 | `debug-glop` | temporary debugging tool for the patch field |
 
@@ -157,6 +175,8 @@ an animation can be reused: animate the `Value` port of `Ops.TimeLine.Anim` and 
 
 - editing an op's code re-executes it: all instances of the op are recreated and get new op ids, so get them again afterwards.
 - only one op can be opened in the code editor at a time.
+- never run "Create new patch" through `run-command`: the new patch has no McpServer op, so the connection is gone.
+- changes to the standalone's main process (e.g. its api) need an app restart, "Reload Editor" is not enough.
 - the McpServer op itself can be edited through mcp, the server restarts after the change. until it is listening again (a few seconds) requests fail, and a broken change stops the server, so it can not be fixed through mcp anymore.
 
 ### code structure
@@ -165,15 +185,17 @@ the op code is split into include attachments (`att_inc_*.js`), they are put in 
 
 | file | |
 |---|---|
-| `Ops.Mcp.McpServer.js` | ports, shared helpers, resources and the remaining tools (ports, links, ops, saving, commands, op docs, profilers, build info, reload), `buildMcpServer`, the http server |
+| `Ops.Mcp.McpServer.js` | ports, shared helpers, call stats, resources and the remaining tools (ports, links, ops, saving, uploading, commands, op docs, profilers, build info, reload), `buildMcpServer`, the http server |
 | `att_inc_anim.js` | timeline, animated ports, keyframes and easings |
 | `att_inc_console.js` | `get-console-logs`: the editor console via the devtools protocol |
-| `att_inc_opfiles.js` | reading, editing and creating op code and attachments |
+| `att_inc_opfiles.js` | reading, editing, creating, renaming and cloning op code, attachments and dependencies |
 | `att_inc_patchinfo.js` | patch errors, the patch overview, a single patch op |
 | `att_inc_patchjson.js` | loading patches from cables.gl, upgrading/downgrading ops, clearing the patch |
-| `att_inc_patchview.js` | scrolling/zooming the patch field, focusing, selecting and moving ops |
-| `att_inc_screenshots.js` | screenshots of the canvas, the patch field and the timeline |
+| `att_inc_patchview.js` | scrolling/zooming the patch field, focusing, selecting, bookmarking and moving ops |
+| `att_inc_screenshots.js` | screenshots of the canvas, the patch field and the timeline, inspecting element ports |
 | `att_inc_tidyup.js` | `tidy-up-ops` and its layout |
+
+`buildMcpServer` wraps `server.tool` and `server.registerResource` before anything is registered, so every tool and resource is counted in `Stats` under its name without code in the tools themselves.
 
 an include must not use constants of the main op code at the top level, only inside functions. the `register...Tools` functions run while the server is built, so constants they use in tool descriptions or schemas have to be declared before `buildMcpServer()` is called, or in an include.
 

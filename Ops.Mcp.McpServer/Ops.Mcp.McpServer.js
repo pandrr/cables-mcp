@@ -54,6 +54,7 @@ const KEYFRAME_TIME_TOLERANCE = 0.0005;
 const LISTEN_RETRY_MS = 20;
 const LISTEN_MAX_RETRIES = 1150;
 const RELOAD_EDITOR_DELAY_MS = 300;
+const COLLECTION_LOAD_TIMEOUT_MS = 30000;
 
 const CONSOLE_DEFAULT_LIMIT = 100;
 const CONSOLE_LEVELS = ["verbose", "info", "warning", "error"];
@@ -181,6 +182,24 @@ function logMcp(_log)
 // the log port starts with this line instead of "", relinking after an op reload copies the current value to the logger
 logStatus("mcp server starting");
 
+// extension and team ops are not known to the editor until their collection is loaded, like "Load" in the op search
+function isCollectionOpName(objName)
+{
+    return objName.startsWith("Ops.Extension.") || objName.startsWith("Ops.Team.");
+}
+
+function loadCollection(objName)
+{
+    return new Promise((resolve) =>
+    {
+        gui.serverOps.loadCollectionOps(objName, () =>
+        {
+            s.buildList();
+            resolve();
+        });
+    });
+}
+
 // readable name of an op for the log, e.g. "Rectangle" instead of its id
 function opLabel(opId)
 {
@@ -220,6 +239,7 @@ function setPortValueUndoable(opId, portName, value)
         const p = o.getPort(portName);
         if (!p) return;
         p.set(v);
+        p.emitEvent("onValueChangeUi");
         gui.emitEvent("portValueEdited", o, p, v);
         gui.savedState.setUnSaved("mcpSetPortValue", o.getSubPatch());
         if (gui.patchView.isCurrentOp(o)) o.refreshParams();
@@ -486,6 +506,8 @@ function buildMcpServer()
             const port = targetOp.getPort(portName);
             if (!port) return respondText("no port named \"" + portName + "\" on op " + opId);
 
+            if (port.getType() == CABLES.Port.TYPE_STRING && value !== null && typeof value == "object") value = JSON.stringify(value);
+
             setPortValueUndoable(opId, portName, value);
 
             return respondText("set " + opId + "." + portName + " = " + JSON.stringify(value));
@@ -519,7 +541,7 @@ function buildMcpServer()
 
     server.tool(
         "link-ports",
-        "connect an output port of one op (opId1/portName1) to an input port of another op (opId2/portName2). both ports need the same type (number, trigger, object...). an op added by add-op without x/y is placed here: below the op linked to its input, or above the op it feeds. an output can feed many inputs, an input has only one link. undoable as one step.", { "opId1": param.opId().describe("id of the op with the output port"), "portName1": param.portName().describe("output port name, e.g. \"Next\" or \"Result\""), "opId2": param.opId().describe("id of the op with the input port"), "portName2": param.portName().describe("input port name, e.g. \"Exec\" or \"Value\"") },
+        "connect an output port of one op (opId1/portName1) to an input port of another op (opId2/portName2). both ports need the same type (number, trigger, object...). an op added by add-op without x/y is placed here: below the op linked to its input, or above the op it feeds. an output can feed many inputs; a value input has only one link, linking it again replaces the old link (trigger inputs can have many). undoable as one step.", { "opId1": param.opId().describe("id of the op with the output port"), "portName1": param.portName().describe("output port name, e.g. \"Next\" or \"Result\""), "opId2": param.opId().describe("id of the op with the input port"), "portName2": param.portName().describe("input port name, e.g. \"Exec\" or \"Value\"") },
         ({ opId1, portName1, opId2, portName2 }) =>
         {
             logMcp("link " + opLabel(opId1) + "." + portName1 + " -> " + opLabel(opId2) + "." + portName2);
@@ -535,14 +557,30 @@ function buildMcpServer()
             if (!op2.getPort(portName2)) return respondError("no port named \"" + portName2 + "\" on op " + opId2);
 
             const undoGroup = CABLES.UI.undo.startGroup();
+
+            // a value input has only one link, like dragging a cable in the editor the new link replaces the old one; trigger inputs can have many
+            const portIn = op2.getPort(portName2);
+            const oldLinks = [];
+            if (portIn.getType() !== CABLES.Port.TYPE_TRIGGER)
+            {
+                for (let i = 0; i < portIn.links.length; i++) oldLinks.push(portIn.links[i].portOut);
+                portIn.removeLinks();
+            }
+
             const link = CABLES.patch.link(op1, portName1, op2, portName2);
 
-            if (!link) return respondError("could not link " + opId1 + "." + portName1 + " -> " + opId2 + "." + portName2 + " (incompatible ports?)");
+            if (!link)
+            {
+                for (let i = 0; i < oldLinks.length; i++) CABLES.patch.link(oldLinks[i].op, oldLinks[i].name, op2, portName2);
+                CABLES.UI.undo.endGroup(undoGroup, "Link ports");
+                return respondError("could not link " + opId1 + "." + portName1 + " -> " + opId2 + "." + portName2 + " (incompatible ports?)");
+            }
 
             const placedOp = placeLinkedOp(link);
             CABLES.UI.undo.endGroup(undoGroup, "Link ports");
 
             let text = "linked " + opId1 + "." + portName1 + " -> " + opId2 + "." + portName2;
+            if (oldLinks.length) text += "; replaced the link from " + oldLinks.map((p) => p.op.id + "." + p.name).join(", ");
             if (placedOp) text += "; placed " + placedOp.id + " at " + placedOp.uiAttribs.translate.x + "," + placedOp.uiAttribs.translate.y;
 
             const cycle = cycleThrough(op2, new Set(CABLES.patch.ops));
@@ -728,11 +766,22 @@ function buildMcpServer()
 
     server.tool(
         "add-op",
-        "add a new op to the current patch by its full op name (objName), e.g. Ops.Anim.Timer_v2; get valid names from search-ops. returns the new op's id (use it with link-ports / set-port-value) and its port names. leave x/y out: link-ports then places the op below the op linked to its input (or above the op it feeds), cables flow from top to bottom. only give x/y when the user asks for a position. when adding several ops, call tidy-up-ops with all new op ids at the end.", { "objName": param.opName(), "x": z.number().optional().describe("only when the user asks for a position: x in patch coordinates"), "y": z.number().optional().describe("only when the user asks for a position: y in patch coordinates") },
+        "add a new op to the current patch by its full op name (objName), e.g. Ops.Anim.Timer_v2; get valid names from search-ops. extension and team ops (Ops.Extension.*, Ops.Team.*) are found by search-ops only as their collection until it is loaded: add-op with the full op name loads it. returns the new op's id (use it with link-ports / set-port-value) and its port names. leave x/y out: link-ports then places the op below the op linked to its input (or above the op it feeds), cables flow from top to bottom. only give x/y when the user asks for a position. when adding several ops, call tidy-up-ops with all new op ids at the end.", { "objName": param.opName(), "x": z.number().optional().describe("only when the user asks for a position: x in patch coordinates"), "y": z.number().optional().describe("only when the user asks for a position: y in patch coordinates") },
         async ({ objName, x, y }) =>
         {
             logMcp("add op " + objName);
 
+            if (!gui.opDocs.getOpDocByName(objName) && isCollectionOpName(objName))
+            {
+                try
+                {
+                    await withTimeout(loadCollection(objName), COLLECTION_LOAD_TIMEOUT_MS, "loading the ops of " + objName);
+                }
+                catch (e)
+                {
+                    return respondError("could not load the collection of \"" + objName + "\": " + e.message);
+                }
+            }
             if (!gui.opDocs.getOpDocByName(objName)) return respondError("no op named \"" + objName + "\", find the name with search-ops");
 
             const placeLater = x === undefined && y === undefined;
