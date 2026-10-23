@@ -160,4 +160,44 @@ function registerPatchInfoTools(server)
             return respondText(JSON.stringify(serialized, null, 1));
         }
     );
+
+    server.tool(
+        "get-port-values",
+        "the current runtime values of all input and output ports of an op, including linked inputs and outputs, which get-patch-op leaves out. one line per port: in/out, name, type and value. long strings are shortened to their start and length, objects and arrays are summarized. use it to check what data actually flows through a link.", { "opId": param.opId() },
+        ({ opId }) =>
+        {
+            logMcp("get port values " + opLabel(opId));
+
+            const targetOp = CABLES.patch.getOpById(opId);
+            if (!targetOp) return respondError("no op found with id " + opId);
+
+            const lines = [];
+            for (const p of targetOp.portsIn) lines.push("in  " + p.name + " (" + p.getTypeString() + "): " + describePortValue(p.get()));
+            for (const p of targetOp.portsOut) lines.push("out " + p.name + " (" + p.getTypeString() + "): " + describePortValue(p.get()));
+            return respondText(lines.join("\n"));
+        }
+    );
+}
+
+const PORT_VALUE_MAX_LENGTH = 200;
+
+function describePortValue(v)
+{
+    if (v === null || v === undefined) return String(v);
+    if (typeof v == "string")
+    {
+        if (v.length <= PORT_VALUE_MAX_LENGTH) return JSON.stringify(v);
+        return JSON.stringify(v.substring(0, PORT_VALUE_MAX_LENGTH)) + "... (" + v.length + " chars)";
+    }
+    if (typeof v != "object") return String(v);
+    if (Array.isArray(v) || ArrayBuffer.isView(v)) return (v.constructor ? v.constructor.name : "Array") + " length " + v.length;
+    if (v instanceof Element) return "<" + v.tagName.toLowerCase() + "> element";
+
+    let str = "";
+    try { str = JSON.stringify(v); }
+    catch (e) { str = ""; }
+    const name = v.constructor ? v.constructor.name : "Object";
+    if (!str) return name;
+    if (str.length > PORT_VALUE_MAX_LENGTH) str = str.substring(0, PORT_VALUE_MAX_LENGTH) + "... (" + str.length + " chars)";
+    return name + " " + str;
 }

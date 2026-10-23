@@ -342,13 +342,18 @@ function waitForRenderedFrame()
 // saves the current patch to disk/server, the same way the editor's own save
 // (ctrl+s / save button) does. force=true skips the guest/unsaved-changes
 // warning dialogs, since there is no user around to click through them.
+// the editor passes the error of a failed save to the callback, e.g. CANCELLED when electron's save-as dialog
+// for a patch without a file was closed
 function savePatch()
 {
-    return new Promise((resolve) =>
+    return new Promise((resolve, reject) =>
     {
-        gui.patchView.store.saveCurrentProject(() =>
+        gui.patchView.store.saveCurrentProject((err) =>
         {
-            resolve();
+            if (!err) return resolve();
+            let msg = err.msg || err;
+            if (msg == "CANCELLED") msg += " (the patch has no file yet and the save-as dialog was closed)";
+            reject(new Error(msg));
         }, true);
     });
 }
@@ -495,7 +500,7 @@ function buildMcpServer()
 
     server.tool(
         "set-port-value",
-        "set the value of an input port of an op in the current patch. numbers for number ports, true/false or 1/0 for booleans, the option text for dropdowns and switches (e.g. \"Center\"), a json array for array ports. linked ports get their value from the link, unlink them first.", { "opId": param.opId(), "portName": param.portName(), "value": z.any().describe("the new value, its type has to match the port") },
+        "set the value of an input port of an op in the current patch. numbers for number ports, true/false or 1/0 for booleans, the option text for dropdowns and switches (e.g. \"Center\"). array and object ports can not be set, link an op that creates the data instead (e.g. Ops.Array.StringToArray_v3 for a list of numbers). linked ports get their value from the link, unlink them first.", { "opId": param.opId(), "portName": param.portName(), "value": z.any().describe("the new value, its type has to match the port") },
         ({ opId, portName, value }) =>
         {
             logMcp("set " + opLabel(opId) + "." + portName + " = " + String(JSON.stringify(value)).substring(0, 60));
@@ -505,6 +510,8 @@ function buildMcpServer()
 
             const port = targetOp.getPort(portName);
             if (!port) return respondText("no port named \"" + portName + "\" on op " + opId);
+            if (port.getType() == CABLES.Port.TYPE_ARRAY || port.getType() == CABLES.Port.TYPE_OBJECT)
+                return respondError("port \"" + portName + "\" is an " + port.getTypeString().toLowerCase() + " port, its value can not be set directly: link an op that creates the data, e.g. Ops.Array.StringToArray_v3 (Type Numbers) for a list of numbers");
 
             if (port.getType() == CABLES.Port.TYPE_STRING && value !== null && typeof value == "object") value = JSON.stringify(value);
 
@@ -782,7 +789,7 @@ function buildMcpServer()
                     return respondError("could not load the collection of \"" + objName + "\": " + e.message);
                 }
             }
-            if (!gui.opDocs.getOpDocByName(objName)) return respondError("no op named \"" + objName + "\", find the name with search-ops");
+            if (!await loadOpDoc(objName)) return respondError("no op named \"" + objName + "\", find the name with search-ops");
 
             const placeLater = x === undefined && y === undefined;
             const uiAttribs = {};
@@ -979,10 +986,11 @@ function buildMcpServer()
     server.tool(
         "get-op-docs",
         "get the documentation of an op by its full op name (objName), e.g. Ops.Gl.Meshes.Circle_v2: summary, description, port documentation, ports layout, libs/dependencies and whether a newer version exists (oldVersion). read it before using an op to know its exact port names.", { "objName": param.opName() },
-        ({ objName }) =>
+        async ({ objName }) =>
         {
             logMcp("op docs " + objName);
 
+            await loadOpDoc(objName);
             const doc = getOpDocData(objName);
             if (!doc) return respondError("no op docs found for \"" + objName + "\", use search-ops to find op names");
 

@@ -1,16 +1,10 @@
 // reading and writing op code and attachments
 
-function getOpSource(opname)
+async function getOpSource(opname)
 {
+    const opDoc = await findOpDoc(opname);
     return new Promise((resolve, reject) =>
     {
-        const opDoc = gui.opDocs.getOpDocByName(opname);
-        if (!opDoc)
-        {
-            reject(new Error("no op found with name " + opname));
-            return;
-        }
-
         CABLESUILOADER.talkerAPI.send("getOpCode", { "opname": opDoc.id, "projectId": gui.patchId }, (err, rslt) =>
         {
             if (err) reject(new Error(err));
@@ -32,9 +26,35 @@ function getOpDocOrThrow(opname)
     return opDoc;
 }
 
+// old and deprecated op versions are not in the editor's op docs until one of their versions is loaded,
+// ask electron for the docs of all versions of the op like the editor does when it replaces an op version
+async function loadOpDoc(opname)
+{
+    const known = gui.opDocs.getOpDocByName(opname);
+    if (known || !opname || !opname.startsWith("Ops.")) return known;
+
+    try
+    {
+        const res = await withTimeout(talkerSend("getOpDocs", { "opIdentifier": opname }), 10000, "getOpDocs");
+        if (res && res.opDocs && res.opDocs.length) gui.opDocs.addOpDocs(res.opDocs);
+    }
+    catch (e)
+    {
+        return null;
+    }
+    return gui.opDocs.getOpDocByName(opname);
+}
+
+async function findOpDoc(opname)
+{
+    const opDoc = await loadOpDoc(opname);
+    if (!opDoc) throw new Error("no op found with name " + opname);
+    return opDoc;
+}
+
 async function readOpAttachment(opname, name)
 {
-    const opDoc = getOpDocOrThrow(opname);
+    const opDoc = await findOpDoc(opname);
     const res = await talkerSend("opAttachmentGet", { "opname": opDoc.id, "name": attachmentFileName(name) });
     if (!res || res.content === undefined || res.content === null) throw new Error("no attachment " + attachmentFileName(name) + " in op " + opname + ", see list-op-attachments");
     return res.content;
@@ -43,7 +63,7 @@ async function readOpAttachment(opname, name)
 // writes an attachment, creates it first if the op does not have it yet
 async function writeOpAttachment(opname, name, content)
 {
-    const opDoc = getOpDocOrThrow(opname);
+    const opDoc = await findOpDoc(opname);
     const fileName = attachmentFileName(name);
     opDoc.attachmentFiles = opDoc.attachmentFiles || [];
 
@@ -112,7 +132,7 @@ function waitForOpDoc(opname, timeoutMs)
 // renames an op with the editor's rename (electron only), all its instances in the patch are replaced
 async function renameOp(oldName, newName)
 {
-    getOpDocOrThrow(oldName);
+    await findOpDoc(oldName);
     if (gui.opDocs.getOpDocByName(newName)) throw new Error("op " + newName + " already exists");
 
     await withTimeout(new Promise((resolve, reject) =>
@@ -126,7 +146,7 @@ async function renameOp(oldName, newName)
 // clones an op to a new name (any namespace the platform allows, e.g. a new version Ops.X_v2), optionally replacing its instances in the patch
 async function cloneOp(opname, newName, replaceInPatch)
 {
-    const opDoc = getOpDocOrThrow(opname);
+    const opDoc = await findOpDoc(opname);
     if (gui.opDocs.getOpDocByName(newName)) throw new Error("op " + newName + " already exists");
 
     await withTimeout(new Promise((resolve, reject) =>
@@ -146,7 +166,7 @@ async function cloneOp(opname, newName, replaceInPatch)
 // so saving that tab later does not bring back the old code
 async function saveOpCode(opname, code)
 {
-    const opDoc = getOpDocOrThrow(opname);
+    const opDoc = await findOpDoc(opname);
     const res = await talkerSend("saveOpCode", { "opname": opDoc.id, "code": code, "format": false });
     if (!res.success) throw new Error(res.error ? JSON.stringify(res.error) : "saving failed");
     if (res.updated) gui.patchView.store.setServerDate(res.updated);
@@ -240,6 +260,7 @@ async function readResourceContent(uri)
     if (uri.startsWith("cables://opdoc/"))
     {
         const objName = uri.replace("cables://opdoc/", "");
+        await loadOpDoc(objName);
         const doc = getOpDocData(objName);
         if (!doc) throw new Error("no op docs found for " + objName);
         return { "mimeType": "application/json", "text": JSON.stringify(doc, null, 1) };
@@ -412,7 +433,7 @@ function registerOpFileTools(server)
 
             try
             {
-                const opDoc = getOpDocOrThrow(opname);
+                const opDoc = await findOpDoc(opname);
                 await talkerSend("opSetSummary", { "opId": opDoc.id, "summary": summary });
                 opDoc.summary = summary;
                 gui.opSelect().reload();
@@ -449,11 +470,11 @@ function registerOpFileTools(server)
         "list-op-attachments",
         "list the attachment files of an op (e.g. att_inc_node.js, att_shader.vert), by full op name. read them with read-op-attachment, change them with write-op-attachment.",
         { "opname": param.opName() },
-        ({ opname }) =>
+        async ({ opname }) =>
         {
             logMcp("list attachments " + opname);
 
-            const opDoc = gui.opDocs.getOpDocByName(opname);
+            const opDoc = await loadOpDoc(opname);
             if (!opDoc) return respondError("no op found with name " + opname);
 
             const files = opDoc.attachmentFiles || [];
@@ -513,7 +534,7 @@ function registerOpFileTools(server)
 
             try
             {
-                const opDoc = getOpDocOrThrow(opname);
+                const opDoc = await findOpDoc(opname);
                 if (opDoc.attachmentFiles && !opDoc.attachmentFiles.includes(fileName)) return respondError(opname + " has no attachment " + fileName + ", see list-op-attachments");
 
                 await withTimeout(talkerSend("opAttachmentDelete", { "opname": opDoc.id, "name": fileName }), 10000, "opAttachmentDelete");
@@ -591,7 +612,7 @@ function registerOpFileTools(server)
 
             try
             {
-                const opDoc = getOpDocOrThrow(opname);
+                const opDoc = await findOpDoc(opname);
                 return respondText(JSON.stringify({ "dependencies": opDoc.dependencies || [], "supportedTypes": CABLES.platform.getSupportedOpDependencyTypes() }, null, 1));
             }
             catch (e)
@@ -611,7 +632,7 @@ function registerOpFileTools(server)
 
             try
             {
-                const opDoc = getOpDocOrThrow(opname);
+                const opDoc = await findOpDoc(opname);
                 const supportedTypes = CABLES.platform.getSupportedOpDependencyTypes();
                 if (!supportedTypes.includes(type)) return respondError("unsupported dependency type " + type + ", use one of: " + supportedTypes.join(", "));
 
@@ -644,7 +665,7 @@ function registerOpFileTools(server)
 
             try
             {
-                const opDoc = getOpDocOrThrow(opname);
+                const opDoc = await findOpDoc(opname);
                 const existing = findOpDependency(opDoc, src);
                 if (!existing) return respondError(opname + " has no dependency " + src + ", see list-op-dependencies");
 
@@ -668,7 +689,7 @@ const CHANGELOG_MAX_ENTRIES = 100000;
 
 async function readOpChangelog(opname)
 {
-    const opDoc = getOpDocOrThrow(opname);
+    const opDoc = await findOpDoc(opname);
     const res = await withTimeout(talkerSend("getOpInfo", { "opName": opDoc.id, "cl": CHANGELOG_MAX_ENTRIES, "sort": "asc" }), 10000, "getOpInfo");
     return (res && res.changelog) || [];
 }
@@ -755,7 +776,7 @@ function dependencySrc(name)
 
 async function readOpDependency(opname, name)
 {
-    const opDoc = getOpDocOrThrow(opname);
+    const opDoc = await findOpDoc(opname);
     const res = await talkerSend("getOpDependency", { "opname": opDoc.id, "name": dependencySrc(name) });
     let content = res ? res.content : undefined;
     if (content === undefined && res && res.data) content = res.data.content;
@@ -767,7 +788,7 @@ async function readOpDependency(opname, name)
 // others are saved through the attachment path, which formats js of core ops
 async function writeOpDependency(opname, name, content, type, exportName)
 {
-    const opDoc = getOpDocOrThrow(opname);
+    const opDoc = await findOpDoc(opname);
     const src = dependencySrc(name);
     const fileName = src.substring(2);
 

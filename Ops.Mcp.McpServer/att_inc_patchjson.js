@@ -297,7 +297,7 @@ function registerPatchJsonTools(server)
         {
             logMcp("example " + params.opname);
 
-            const opDoc = gui.opDocs.getOpDocByName(params.opname);
+            const opDoc = await loadOpDoc(params.opname);
             if (!opDoc) return respondError("no op found with name " + params.opname);
 
             const example = findExamplePatch(opDoc);
