@@ -188,9 +188,128 @@ function placeLinkedOp(link)
     return null;
 }
 
+// what an op draws in the patch field: its box (with extended title) and its comment text, if any
+function opDrawnRects(o)
+{
+    const glOp = gui.patchView.patchRenderer.getGlOp(o);
+    if (!glOp || !o.uiAttribs.translate) return [];
+
+    const x = o.uiAttribs.translate.x;
+    const y = o.uiAttribs.translate.y;
+    const rects = [{ "op": o, "part": "op", "x": x, "y": y, "w": glOp.w, "h": glOp.h }];
+
+    const comment = glOp._glComment;
+    if (comment && comment.text) rects.push({ "op": o, "part": "comment", "x": x + comment.x, "y": y + comment.y, "w": comment.width, "h": comment.height });
+    return rects;
+}
+
+function rectsOverlap(a, b)
+{
+    return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+}
+
+// true if the straight line from x1,y1 to x2,y2 passes through the rect (liang-barsky clipping)
+function lineHitsRect(x1, y1, x2, y2, r)
+{
+    let t0 = 0;
+    let t1 = 1;
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const checks = [[-dx, x1 - r.x], [dx, r.x + r.w - x1], [-dy, y1 - r.y], [dy, r.y + r.h - y1]];
+    for (const check of checks)
+    {
+        const p = check[0];
+        const q = check[1];
+        if (p == 0)
+        {
+            if (q < 0) return false;
+            continue;
+        }
+        const t = q / p;
+        if (p < 0) t0 = Math.max(t0, t);
+        else t1 = Math.min(t1, t);
+        if (t0 > t1) return false;
+    }
+    return true;
+}
+
+function layoutLabel(o)
+{
+    return o.id + " " + (o.uiAttribs.title || o.objName.split(".").pop());
+}
+
+// layout problems between the ops: overlapping boxes and comments, links going up, links running behind other ops
+function layoutProblems(ops)
+{
+    const set = new Set(ops);
+    const rects = [];
+    for (const o of ops) for (const r of opDrawnRects(o)) rects.push(r);
+
+    const overlaps = [];
+    for (let i = 0; i < rects.length; i++)
+        for (let j = i + 1; j < rects.length; j++)
+        {
+            const a = rects[i];
+            const b = rects[j];
+            if (a.op == b.op || !rectsOverlap(a, b)) continue;
+            overlaps.push((a.part == "comment" ? "comment of " : "") + layoutLabel(a.op) + " overlaps " + (b.part == "comment" ? "the comment of " : "") + layoutLabel(b.op));
+        }
+
+    const upward = [];
+    const behind = [];
+    for (const o of ops)
+        for (const portOut of o.portsOut)
+            for (const link of portOut.links)
+            {
+                const opIn = link.portIn.op;
+                if (!set.has(opIn) || !opIn.uiAttribs.translate) continue;
+                const boxOut = opDrawnRects(o)[0];
+                const boxIn = opDrawnRects(opIn)[0];
+                if (!boxOut || !boxIn) continue;
+
+                const name = layoutLabel(o) + "." + portOut.name + " -> " + layoutLabel(opIn) + "." + link.portIn.name;
+                if (boxIn.y < boxOut.y + boxOut.h) upward.push(name);
+
+                const x1 = boxOut.x + portCenterX(o, portOut);
+                const y1 = boxOut.y + boxOut.h;
+                const x2 = boxIn.x + portCenterX(opIn, link.portIn);
+                const y2 = boxIn.y;
+                for (const r of rects)
+                    if (r.part == "op" && r.op != o && r.op != opIn && lineHitsRect(x1, y1, x2, y2, r)) behind.push(name + " runs behind " + layoutLabel(r.op));
+            }
+
+    return { "overlaps": overlaps, "upward": upward, "behind": behind };
+}
+
 // registers the tools of this file, called by buildMcpServer
 function registerTidyUpTools(server)
 {
+    server.tool(
+        "check-layout",
+        "check the patch field layout as text instead of a screenshot: lists ops whose boxes or comments overlap, links going up (the input op is not below the output op) and links running behind other ops (approximated as straight lines). checks the ops of the current subpatch, or only opIds. fix problems with move-ops or tidy-up-ops.", { "opIds": z.array(param.opId()).optional().describe("only check these ops, default all ops of the current subpatch") },
+        ({ opIds }) =>
+        {
+            logMcp("check layout");
+
+            let ops = visiblePatchOps();
+            if (opIds)
+            {
+                ops = opIds.map((opId) => CABLES.patch.getOpById(opId));
+                const missing = opIds.filter((opId, i) => !ops[i]);
+                if (missing.length) return respondError("no op found with id " + missing.join(", "));
+            }
+
+            const problems = layoutProblems(ops);
+            const lines = [];
+            if (problems.overlaps.length) lines.push("overlaps:\n" + problems.overlaps.join("\n"));
+            if (problems.upward.length) lines.push("links going up:\n" + problems.upward.join("\n"));
+            if (problems.behind.length) lines.push("links behind ops:\n" + problems.behind.join("\n"));
+
+            if (!lines.length) return respondText("checked " + ops.length + " ops: no overlaps, no links going up or behind ops");
+            return respondText("checked " + ops.length + " ops\n" + lines.join("\n"));
+        }
+    );
+
     server.tool(
         "tidy-up-ops",
         "tidy up the layout of ops, call it after adding and linking several ops, passing all new op ids: arranges them in rows following their links (every op below all ops linked to its inputs), each op at the x of the op above until the links split, split children side by side in port order. ops never overlap. unselected ops are never moved, the selected ops are placed around them; a selected op whose linked ops above are all unselected keeps its position. links may cross. snapped to the grid. works on the selected ops, or on opIds; all have to be in the current subpatch. undoable as one step. if no valid layout is found (link cycle, no free place) nothing is changed and the reason is returned.", { "opIds": z.array(param.opId()).optional().describe("ids of the ops to arrange, usually all ops you just added; without it the selected ops are used"), "dryRun": z.boolean().optional().describe("only report the new positions, do not move anything") },

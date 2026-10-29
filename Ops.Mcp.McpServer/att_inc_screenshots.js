@@ -164,17 +164,22 @@ function registerScreenshotTools(server)
 {
     server.tool(
         "inspect-element-port",
-        "inspect the html element in an object port of an op (input or output), e.g. a canvas2d Element output or an image element. canvas, image, video and image bitmap values are returned as a png image plus their size, other html elements as text: tag, id, class, client rect, style and shortened outer html. maxSize limits the longer edge of the image in pixels (default " + SCREENSHOT_DEFAULT_MAX_SIZE + ", 0 = original size).", { "opId": param.opId(), "portName": param.portName().describe("name of an object port holding an html element, e.g. \"Element\""), "maxSize": param.maxSize() },
-        async ({ opId, portName, maxSize }) =>
+        "inspect the html element in an object port of an op (input or output), e.g. a canvas2d Element output or an image element. canvas, image, video and image bitmap values are returned as a png image plus their size, other html elements as text: tag, id, class, client rect, style and shortened outer html. maxSize limits the longer edge of the image in pixels (default " + SCREENSHOT_DEFAULT_MAX_SIZE + ", 0 = original size). stackKey inspects a hidden copy of a stacked op.", { "opId": param.opId(), "portName": param.portName().describe("name of an object port holding an html element, e.g. \"Element\""), "maxSize": param.maxSize(), "stackKey": param.stackKey() },
+        async ({ opId, portName, maxSize, stackKey }) =>
         {
-            logMcp("inspect element port " + opLabel(opId) + "." + portName);
+            logMcp("inspect element port " + opLabel(opId) + "." + portName + (stackKey ? " copy " + stackKey : ""));
 
-            const o = CABLES.patch.getOpById(opId);
-            if (!o) return respondError("no op found with id " + opId);
+            const headOp = CABLES.patch.getOpById(opId);
+            if (!headOp) return respondError("no op found with id " + opId);
+
+            const target = getStackTarget(headOp, stackKey);
+            if (target.error) return respondError(target.error);
+            const o = target.op;
+
             const port = o.getPort(portName);
             if (!port) return respondError("op " + opLabel(opId) + " has no port " + portName);
 
-            const value = port.get();
+            const value = stackKey ? port.value : port.get();
             if (!value) return respondText("port " + portName + " is empty");
 
             if (isDrawable(value))
@@ -222,14 +227,17 @@ function registerScreenshotTools(server)
 
     server.tool(
         "patch-field-screenshot",
-        "take a screenshot of the patch field (the editor's op graph with ops and links, not the rendering canvas) as a png image. maxSize limits the longer edge in pixels (default " + SCREENSHOT_DEFAULT_MAX_SIZE + ", 0 = original size). use patch-view to scroll/zoom first; panels on top of the patch field are not in the image.", { "maxSize": param.maxSize() },
+        "take a screenshot of the patch field (the editor's op graph with ops and links, not the rendering canvas) as a png image, at most " + PATCHFIELD_SCREENSHOT_MAX_SIZE + " pixels on the longer edge. maxSize can make it smaller, never bigger. use patch-view to scroll/zoom first; panels on top of the patch field are not in the image.", { "maxSize": z.number().optional().describe("longest edge of the returned image in pixels, at most and default " + PATCHFIELD_SCREENSHOT_MAX_SIZE) },
         async ({ maxSize }) =>
         {
             logMcp("patch field screenshot");
 
+            let size = PATCHFIELD_SCREENSHOT_MAX_SIZE;
+            if (maxSize > 0) size = Math.min(maxSize, PATCHFIELD_SCREENSHOT_MAX_SIZE);
+
             try
             {
-                const png = await grabPatchFieldScreenshot(maxSize ?? SCREENSHOT_DEFAULT_MAX_SIZE);
+                const png = await grabPatchFieldScreenshot(size);
                 return respond({ "content": [{ "type": "image", "data": png, "mimeType": "image/png" }] });
             }
             catch (e)

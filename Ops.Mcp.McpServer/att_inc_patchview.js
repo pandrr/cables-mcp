@@ -93,7 +93,7 @@ function registerPatchViewTools(server)
 
     server.tool(
         "focus-op",
-        "scroll/zoom the patch editor view to center on an op and open its param panel, so the person looking at the editor can see it. does not affect rendering.", { "opId": param.opId() },
+        "scroll/zoom the patch editor view to center on an op and open its param panel, so the person looking at the editor can see it. switches into the op's subpatch first if needed. does not affect rendering.", { "opId": param.opId() },
         ({ opId }) =>
         {
             logMcp("focus " + opLabel(opId));
@@ -103,9 +103,21 @@ function registerPatchViewTools(server)
 
             if (!CABLES.UI || !gui.patchView || !gui.patchView.patchRenderer || !gui.patchView.patchRenderer.focusOp) return respondError("no patch editor UI available to focus on");
 
-            gui.patchView.patchRenderer.focusOp(opId);
+            const subPatch = targetOp.uiAttribs.subPatch || "0";
+            if (subPatch == gui.patchView.getCurrentSubPatch())
+            {
+                gui.patchView.patchRenderer.focusOp(opId);
+                return respondText("focused " + opId + " (" + targetOp.objName + ") in the patch editor");
+            }
 
-            return respondText("focused " + opId + " (" + targetOp.objName + ") in the patch editor");
+            return new Promise((resolve) =>
+            {
+                gui.patchView.setCurrentSubPatch(subPatch, () =>
+                {
+                    gui.patchView.patchRenderer.focusOp(opId);
+                    resolve(respondText("switched to subpatch " + subPatch + " and focused " + opId + " (" + targetOp.objName + ")"));
+                });
+            });
         }
     );
 

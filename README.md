@@ -68,6 +68,7 @@ some clients don't expose resources to the ai, so they can also be used with the
 | tool | |
 |---|---|
 | `get-patch-overview` | compact overview: one line per op with id, name, title, subpatch and links, optionally with changed port values |
+| `get-unreleased-op-ids` | compact JSON list of current-patch op instance ids whose documented ops are unreleased |
 | `get-patch-op` | one op from the patch as json: port values, uiAttribs, storage, links |
 | `get-patch-errors` | ops with errors/warnings (shader errors, missing links, wrong types) and code diagnostics |
 | `add-op` | add an op by its full name, optionally at a position |

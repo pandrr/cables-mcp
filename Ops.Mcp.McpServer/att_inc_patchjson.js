@@ -235,12 +235,19 @@ async function replaceOpVersions(opIds, getTargetName, skipReason, action)
     return lines.join("\n");
 }
 
+// ids of this mcp server op and the ops linked to it, e.g. its logger
+function mcpBranchOpIds()
+{
+    const ids = new Set([op.id]);
+    for (let i = 0; i < op.portsOut.length; i++)
+        for (let j = 0; j < op.portsOut[i].links.length; j++) ids.add(op.portsOut[i].links[j].getOtherPort(op.portsOut[i]).op.id);
+    return ids;
+}
+
 // deletes all ops except this mcp server op and the ops linked to it
 function clearPatchKeepMcp()
 {
-    const keep = new Set([op.id]);
-    for (let i = 0; i < op.portsOut.length; i++)
-        for (let j = 0; j < op.portsOut[i].links.length; j++) keep.add(op.portsOut[i].links[j].getOtherPort(op.portsOut[i]).op.id);
+    const keep = mcpBranchOpIds();
 
     const ids = [];
     for (let i = 0; i < CABLES.patch.ops.length; i++)

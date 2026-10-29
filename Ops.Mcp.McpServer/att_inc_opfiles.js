@@ -218,13 +218,29 @@ function executeOp(opname)
     });
 }
 
+const PORT_TYPE_NAMES = { "0": "number", "1": "trigger", "2": "object", "3": "array", "4": "dynamic", "5": "string" };
+
+// leaves out unset fields and empty strings/arrays, so docs only carry what is really there
+function withoutEmptyFields(obj)
+{
+    const result = {};
+    for (const key in obj)
+    {
+        const value = obj[key];
+        if (value === undefined || value === null || value === "") continue;
+        if (Array.isArray(value) && value.length === 0) continue;
+        result[key] = value;
+    }
+    return result;
+}
+
 // the documentation of an op as a plain object, null if there is none
 function getOpDocData(objName)
 {
     const opDoc = gui.opDocs.getOpDocByName(objName);
     if (!opDoc) return null;
 
-    return {
+    return withoutEmptyFields({
         "name": opDoc.name,
         "id": opDoc.id,
         "summary": opDoc.summary,
@@ -240,7 +256,61 @@ function getOpDocData(objName)
         "dependencies": opDoc.dependencies,
         "ports": opDoc.docs ? opDoc.docs.ports : undefined,
         "layout": opDoc.layout
-    };
+    });
+}
+
+function portTypeText(port)
+{
+    if (port.values) return "select: " + port.values.join(", ");
+    if (port.type == 2 && port.objType) return port.objType;
+    if (port.type == 0 && port.subType) return port.subType;
+    return PORT_TYPE_NAMES[port.type] || String(port.type);
+}
+
+// one port as "- name: type - doc text", select ports by the name set-port-value takes (without " index")
+function portSummaryLine(port, portDocs)
+{
+    let name = port.name;
+    let typeText = portTypeText(port);
+    if (name.endsWith(" index"))
+    {
+        name = name.substring(0, name.length - " index".length);
+        if (!port.values) typeText = "select";
+    }
+
+    let line = "- " + name + ": " + typeText;
+    const docText = portDocs[port.name] || portDocs[name];
+    if (docText) line += " - " + docText;
+    return line;
+}
+
+// short plain text docs of an op: summary, description and ports, null if there are no docs
+function getOpSummaryText(objName)
+{
+    const opDoc = gui.opDocs.getOpDocByName(objName);
+    if (!opDoc) return null;
+
+    const portDocs = {};
+    const docPorts = (opDoc.docs && opDoc.docs.ports) || [];
+    for (let i = 0; i < docPorts.length; i++) portDocs[docPorts[i].name] = docPorts[i].text;
+
+    const lines = [opDoc.name + ": " + (opDoc.summary || "no summary")];
+    if (opDoc.content) lines.push(opDoc.content);
+    if (opDoc.oldVersion) lines.push("old version, a newer version of this op exists");
+
+    if (!opDoc.layout)
+    {
+        lines.push("ports unknown, the op has no saved port layout");
+        return lines.join("\n");
+    }
+
+    const portsIn = opDoc.layout.portsIn || [];
+    const portsOut = opDoc.layout.portsOut || [];
+    lines.push("inputs:");
+    for (let i = 0; i < portsIn.length; i++) lines.push(portSummaryLine(portsIn[i], portDocs));
+    lines.push("outputs:");
+    for (let i = 0; i < portsOut.length; i++) lines.push(portSummaryLine(portsOut[i], portDocs));
+    return lines.join("\n");
 }
 
 // resolves any uri this server hands out (mcpfile:///, cables://op/, cables://opdoc/ or cables://patch.json) to { mimeType, text }
@@ -263,7 +333,7 @@ async function readResourceContent(uri)
         await loadOpDoc(objName);
         const doc = getOpDocData(objName);
         if (!doc) throw new Error("no op docs found for " + objName);
-        return { "mimeType": "application/json", "text": JSON.stringify(doc, null, 1) };
+        return { "mimeType": "application/json", "text": JSON.stringify(doc) };
     }
     if (uri === "cables://patch.json") return { "mimeType": "application/json", "text": JSON.stringify(op.patch.serialize()) };
     throw new Error("unsupported uri " + uri);
@@ -437,11 +507,37 @@ function registerOpFileTools(server)
                 await talkerSend("opSetSummary", { "opId": opDoc.id, "summary": summary });
                 opDoc.summary = summary;
                 gui.opSelect().reload();
+                s.buildList();
                 return respondText("set summary of " + opname + ": " + summary);
             }
             catch (e)
             {
                 return respondError("could not set summary: " + e.message);
+            }
+        }
+    );
+
+    server.tool(
+        "add-op-changelog",
+        "add an entry to the changelog of an op, by full op name, e.g. after fixing a bug. the author is the current standalone user. keep the message short, like \"fixed formula\".",
+        {
+            "opname": param.opName(),
+            "message": z.string().describe("what changed"),
+            "type": z.enum(["bugfix", "improvement", "feature", "new op", "rename", "deprecation"]).optional().describe("kind of change")
+        },
+        async ({ opname, message, type }) =>
+        {
+            logMcp("add changelog " + opname);
+
+            try
+            {
+                await findOpDoc(opname);
+                await talkerSend("addOpChangelog", { "opName": opname, "message": message, "type": type });
+                return respondText("added changelog entry to " + opname + ": " + (type ? type + ": " : "") + message);
+            }
+            catch (e)
+            {
+                return respondError("could not add changelog entry: " + e.message);
             }
         }
     );
@@ -553,7 +649,7 @@ function registerOpFileTools(server)
 
     server.tool(
         "read-op-dependency",
-        "read the content of a local dependency file of an op (e.g. ./lib.js from the op's dependencies, see get-op-docs). fromLine/toLine limit it to a range of lines, find only lists the lines containing that text.",
+        "read the content of a local dependency file of an op (e.g. ./lib.js from the op's dependencies, see get-full-op-docs). fromLine/toLine limit it to a range of lines, find only lists the lines containing that text.",
         { "opname": param.opName(), "name": z.string().describe("dependency file name, e.g. lib.js"), "fromLine": z.number().optional().describe("first line to read, 1 based"), "toLine": z.number().optional().describe("last line to read"), "find": z.string().optional().describe("only list the lines containing this text") },
         async ({ opname, name, fromLine, toLine, find }) =>
         {

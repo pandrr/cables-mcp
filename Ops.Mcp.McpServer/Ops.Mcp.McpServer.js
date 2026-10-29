@@ -12,6 +12,7 @@ const
 
 const MCP_PORT = 3000;
 const SCREENSHOT_DEFAULT_MAX_SIZE = 640;
+const PATCHFIELD_SCREENSHOT_MAX_SIZE = 480;
 const ELEMENT_HTML_MAX_LENGTH = 2000;
 const OP_DOC_POLL_MS = 100;
 
@@ -19,14 +20,14 @@ const SERVER_INSTRUCTIONS = [
     "cables is a node based visual programming editor. a patch is a graph of ops (nodes) connected by links between their ports.",
     "",
     "terms:",
-    "- op name (objName): the full name of an op type, e.g. Ops.Gl.Texture_v3. find names with search-ops, read their ports with get-op-docs.",
+    "- op name (objName): the full name of an op type, e.g. Ops.Gl.Texture_v3. find names with search-ops, read their ports with get-op-summary-doc.",
     "- op id: the id of one op instance in the current patch, e.g. \"a1b2c3d4e\". add-op returns it, get-patch-overview lists all of them. every opId parameter needs this id, never the op name.",
-    "- port: an input or output of an op, addressed by its exact name (case sensitive, spaces included) as listed by add-op or get-op-docs.",
+    "- port: an input or output of an op, addressed by its exact name (case sensitive, spaces included) as listed by add-op or get-op-summary-doc.",
     "- links always go from an output port to an input port of the same type. trigger ports (Exec, Render, Next...) run things: a chain of trigger links starting at Ops.Gl.MainLoop_v2 runs every frame.",
     "",
     "workflow to build or change something in the patch:",
     "1. get-patch-overview to see what is already there.",
-    "2. search-ops to find ops, get-op-docs for their ports (or load-example-patch to see an op in use).",
+    "2. search-ops to find ops, get-op-summary-doc for their ports (or load-example-patch to see an op in use).",
     "3. add-op without x/y, then link-ports and set-port-value.",
     "4. tidy-up-ops once with the ids of all ops you added.",
     "5. check the result: get-patch-errors, screenshot for the webgl canvas, inspect-element-port for html elements and 2d canvases.",
@@ -42,9 +43,10 @@ const SERVER_INSTRUCTIONS = [
 const param = {
     "opId": () => { return z.string().describe("id of an op in the current patch (from add-op or get-patch-overview), e.g. \"a1b2c3d4e\", not the op name"); },
     "opName": () => { return z.string().describe("full op name, e.g. Ops.Gl.Texture_v3 (from search-ops)"); },
-    "portName": () => { return z.string().describe("exact port name, case sensitive (as listed by add-op or get-op-docs), e.g. \"Exec\""); },
+    "portName": () => { return z.string().describe("exact port name, case sensitive (as listed by add-op or get-op-summary-doc), e.g. \"Exec\""); },
     "maxSize": () => { return z.number().optional().describe("longest edge of the returned image in pixels, default " + SCREENSHOT_DEFAULT_MAX_SIZE + ", 0 = original size; bigger images cost more tokens"); },
     "filter": () => { return z.string().optional().describe("only list entries whose name contains this text"); },
+    "stackKey": () => { return z.string().optional().describe("stacked ops only: loop key of a hidden copy, e.g. \"3\" or \"1/3\", leave out for the visible op"); },
     "limit": (defaultValue) => { return z.number().optional().describe("maximum number of entries, default " + defaultValue); }
 };
 const SELF_EXECUTE_DELAY_MS = 100;
@@ -302,6 +304,122 @@ function addOpUndoable(objName, uiAttribs)
     });
 }
 
+// sets an input port value after checking op, port and type, returns a short report, throws with the reason otherwise
+function setPortValueChecked(opId, portName, value)
+{
+    const targetOp = CABLES.patch.getOpById(opId);
+    if (!targetOp) throw new Error("no op found with id " + opId);
+
+    const port = targetOp.getPort(portName);
+    if (!port) throw new Error("no port named \"" + portName + "\" on op " + opId);
+    if (port.getType() == CABLES.Port.TYPE_ARRAY || port.getType() == CABLES.Port.TYPE_OBJECT)
+        throw new Error("port \"" + portName + "\" is an " + port.getTypeString().toLowerCase() + " port, its value can not be set directly: link an op that creates the data, e.g. Ops.Array.StringToArray_v3 (Type Numbers) for a list of numbers");
+
+    if (port.getType() == CABLES.Port.TYPE_STRING && value !== null && typeof value == "object") value = JSON.stringify(value);
+    if (port.getType() == CABLES.Port.TYPE_STRING && (typeof value == "number" || typeof value == "boolean")) value = String(value);
+
+    const options = port.uiAttribs.values;
+    if (Array.isArray(options) && (port.uiAttribs.display == "dropdown" || port.uiAttribs.display == "switch"))
+    {
+        let known = false;
+        for (let i = 0; i < options.length; i++) if (String(options[i]) == String(value)) known = true;
+        if (!known) throw new Error("\"" + value + "\" is not an option of port \"" + portName + "\", options: " + options.join(", "));
+    }
+
+    setPortValueUndoable(opId, portName, value);
+    return "set " + opId + "." + portName + " = " + JSON.stringify(value);
+}
+
+// loads and adds an op, at x/y or, without them, near the view center to be placed later by link-ports. returns the new op, throws with the reason otherwise
+async function addOpChecked(objName, x, y)
+{
+    if (!gui.opDocs.getOpDocByName(objName) && isCollectionOpName(objName))
+    {
+        try
+        {
+            await withTimeout(loadCollection(objName), COLLECTION_LOAD_TIMEOUT_MS, "loading the ops of " + objName);
+        }
+        catch (e)
+        {
+            throw new Error("could not load the collection of \"" + objName + "\": " + e.message);
+        }
+    }
+    if (!await loadOpDoc(objName)) throw new Error("no op named \"" + objName + "\", find the name with search-ops");
+
+    const placeLater = x === undefined && y === undefined;
+    const uiAttribs = {};
+    if (placeLater) uiAttribs.translate = patchViewCenter();
+    else uiAttribs.translate = { "x": x || 0, "y": y || 0 };
+
+    let newOp;
+    try
+    {
+        newOp = await addOpUndoable(objName, uiAttribs);
+    }
+    catch (e)
+    {
+        throw new Error("could not add op \"" + objName + "\": " + e.message);
+    }
+    if (!newOp) throw new Error("could not add op \"" + objName + "\" (no such op? see search-ops)");
+
+    if (placeLater && gui.patchView.patchRenderer.getGlOp(newOp))
+    {
+        const rect = opRect(newOp);
+        moveToNearestFreeSpot(rect, otherOpRects(newOp, false), true, true);
+        newOp.setUiAttribs({ "translate": { "x": rect.x, "y": rect.y } });
+        unplacedOpIds.add(newOp.id);
+    }
+
+    const opDoc = gui.opDocs.getOpDocByName(objName);
+    if (opDoc && !opDoc.layout) gui.serverOps.saveOpLayout(newOp);
+
+    return newOp;
+}
+
+// links an output port to an input port like dragging a cable: a value input keeps only the new link. places an unplaced op of the link.
+// returns a short report, throws with the reason otherwise
+function linkPortsChecked(opId1, portName1, opId2, portName2)
+{
+    const op1 = CABLES.patch.getOpById(opId1);
+    if (!op1) throw new Error("no op found with id " + opId1);
+
+    const op2 = CABLES.patch.getOpById(opId2);
+    if (!op2) throw new Error("no op found with id " + opId2);
+
+    if (!op1.getPort(portName1)) throw new Error("no port named \"" + portName1 + "\" on op " + opId1);
+    if (!op2.getPort(portName2)) throw new Error("no port named \"" + portName2 + "\" on op " + opId2);
+
+    const undoGroup = CABLES.UI.undo.startGroup();
+
+    const portIn = op2.getPort(portName2);
+    const oldLinks = [];
+    if (portIn.getType() !== CABLES.Port.TYPE_TRIGGER)
+    {
+        for (let i = 0; i < portIn.links.length; i++) oldLinks.push(portIn.links[i].portOut);
+        portIn.removeLinks();
+    }
+
+    const link = CABLES.patch.link(op1, portName1, op2, portName2);
+
+    if (!link)
+    {
+        for (let i = 0; i < oldLinks.length; i++) CABLES.patch.link(oldLinks[i].op, oldLinks[i].name, op2, portName2);
+        CABLES.UI.undo.endGroup(undoGroup, "Link ports");
+        throw new Error("could not link " + opId1 + "." + portName1 + " -> " + opId2 + "." + portName2 + " (incompatible ports?)");
+    }
+
+    const placedOp = placeLinkedOp(link);
+    CABLES.UI.undo.endGroup(undoGroup, "Link ports");
+
+    let text = "linked " + opId1 + "." + portName1 + " -> " + opId2 + "." + portName2;
+    if (oldLinks.length) text += "; replaced the link from " + oldLinks.map((p) => p.op.id + "." + p.name).join(", ");
+    if (placedOp) text += "; placed " + placedOp.id + " at " + placedOp.uiAttribs.translate.x + "," + placedOp.uiAttribs.translate.y;
+
+    const cycle = cycleThrough(op2, new Set(CABLES.patch.ops));
+    if (cycle) text += "; warning: this link closes a cycle " + cycle.map((o) => o.id).join(" -> ") + ", tidy-up-ops can not lay these ops out";
+    return text;
+}
+
 // the center of the patch editor view in patch coordinates, snapped to the grid
 function patchViewCenter()
 {
@@ -456,7 +574,7 @@ function buildMcpServer()
 
     server.tool(
         "search-ops",
-        "search through all available ops, best matches first, one per line as \"name: summary\". limit is the number of results (default " + SEARCH_DEFAULT_LIMIT + ", 0 = all). this is the way to find the op name for add-op. use get-op-docs for ports and docs, read-op for the source.", { "str": z.string().describe("search words, e.g. \"texture\" or \"noise\""), "limit": z.number().optional().describe("maximum number of results, default " + SEARCH_DEFAULT_LIMIT + ", 0 = all") },
+        "search through all available ops, best matches first, one per line as \"name: summary\". limit is the number of results (default " + SEARCH_DEFAULT_LIMIT + ", 0 = all). this is the way to find the op name for add-op. use get-op-summary-doc for ports and docs, read-op for the source.", { "str": z.string().describe("search words, e.g. \"texture\" or \"noise\""), "limit": z.number().optional().describe("maximum number of results, default " + SEARCH_DEFAULT_LIMIT + ", 0 = all") },
         ({ str, limit }) =>
         {
             logMcp("search ops \"" + str + "\"");
@@ -505,19 +623,14 @@ function buildMcpServer()
         {
             logMcp("set " + opLabel(opId) + "." + portName + " = " + String(JSON.stringify(value)).substring(0, 60));
 
-            const targetOp = op.patch.getOpById(opId);
-            if (!targetOp) return respondText("no op found with id " + opId);
-
-            const port = targetOp.getPort(portName);
-            if (!port) return respondText("no port named \"" + portName + "\" on op " + opId);
-            if (port.getType() == CABLES.Port.TYPE_ARRAY || port.getType() == CABLES.Port.TYPE_OBJECT)
-                return respondError("port \"" + portName + "\" is an " + port.getTypeString().toLowerCase() + " port, its value can not be set directly: link an op that creates the data, e.g. Ops.Array.StringToArray_v3 (Type Numbers) for a list of numbers");
-
-            if (port.getType() == CABLES.Port.TYPE_STRING && value !== null && typeof value == "object") value = JSON.stringify(value);
-
-            setPortValueUndoable(opId, portName, value);
-
-            return respondText("set " + opId + "." + portName + " = " + JSON.stringify(value));
+            try
+            {
+                return respondText(setPortValueChecked(opId, portName, value));
+            }
+            catch (e)
+            {
+                return respondError(e.message);
+            }
         }
     );
 
@@ -553,46 +666,14 @@ function buildMcpServer()
         {
             logMcp("link " + opLabel(opId1) + "." + portName1 + " -> " + opLabel(opId2) + "." + portName2);
 
-            const op1 = CABLES.patch.getOpById(opId1);
-            if (!op1) return respondError("no op found with id " + opId1);
-
-            const op2 = CABLES.patch.getOpById(opId2);
-            if (!op2) return respondError("no op found with id " + opId2);
-
-            if (!op1.getPort(portName1)) return respondError("no port named \"" + portName1 + "\" on op " + opId1);
-
-            if (!op2.getPort(portName2)) return respondError("no port named \"" + portName2 + "\" on op " + opId2);
-
-            const undoGroup = CABLES.UI.undo.startGroup();
-
-            // a value input has only one link, like dragging a cable in the editor the new link replaces the old one; trigger inputs can have many
-            const portIn = op2.getPort(portName2);
-            const oldLinks = [];
-            if (portIn.getType() !== CABLES.Port.TYPE_TRIGGER)
+            try
             {
-                for (let i = 0; i < portIn.links.length; i++) oldLinks.push(portIn.links[i].portOut);
-                portIn.removeLinks();
+                return respondText(linkPortsChecked(opId1, portName1, opId2, portName2));
             }
-
-            const link = CABLES.patch.link(op1, portName1, op2, portName2);
-
-            if (!link)
+            catch (e)
             {
-                for (let i = 0; i < oldLinks.length; i++) CABLES.patch.link(oldLinks[i].op, oldLinks[i].name, op2, portName2);
-                CABLES.UI.undo.endGroup(undoGroup, "Link ports");
-                return respondError("could not link " + opId1 + "." + portName1 + " -> " + opId2 + "." + portName2 + " (incompatible ports?)");
+                return respondError(e.message);
             }
-
-            const placedOp = placeLinkedOp(link);
-            CABLES.UI.undo.endGroup(undoGroup, "Link ports");
-
-            let text = "linked " + opId1 + "." + portName1 + " -> " + opId2 + "." + portName2;
-            if (oldLinks.length) text += "; replaced the link from " + oldLinks.map((p) => p.op.id + "." + p.name).join(", ");
-            if (placedOp) text += "; placed " + placedOp.id + " at " + placedOp.uiAttribs.translate.x + "," + placedOp.uiAttribs.translate.y;
-
-            const cycle = cycleThrough(op2, new Set(CABLES.patch.ops));
-            if (cycle) text += "; warning: this link closes a cycle " + cycle.map((o) => o.id).join(" -> ") + ", tidy-up-ops can not lay these ops out";
-            return respondText(text);
         }
     );
 
@@ -641,6 +722,9 @@ function buildMcpServer()
                 if (!filter || name.includes(filter)) result.durationsMs[name] = summarize(profiler.durationsFrames[name], "ms");
             for (const name in profiler.countsFrames)
                 if (!filter || name.includes(filter)) result.counts[name] = summarize(profiler.countsFrames[name], "num");
+
+            const glPatch = gui.patchView._patchRenderer;
+            if (glPatch) result.uiThrottle = { "targetFps": glPatch.targetFps || 0, "mouseOverCanvas": glPatch.mouseState.mouseOverCanvas, "note": "targetFps 0 = full rate. the patch field, vizlayer and timeline skip frames when inactive (mouse not over the patch field), so a low \"ui fps\" with targetFps > 0 is throttling, not load. users can turn it off in the preferences (UI Eco Mode)" };
 
             return respondText(JSON.stringify(result));
         }
@@ -734,8 +818,20 @@ function buildMcpServer()
                 "translate": o.uiAttribs.translate,
                 "hasArea": o.uiAttribs.hasArea,
                 "area": o.uiAttribs.area,
-                "glop": g ? { "w": g.w, "h": g.h, "hasResizableAreaGetter": "resizableArea" in g } : null,
+                "glop": g ? { "w": g.w, "h": g.h, "visible": g.visible, "posZ": g.getPosZ(), "hasResizableAreaGetter": "resizableArea" in g } : null,
                 "resizableArea": ra ? { "w": ra.w, "h": ra.h, "_w": ra._w, "_h": ra._h } : null,
+                "ports": g ? o.portsIn.concat(o.portsOut).map((p) =>
+                {
+                    const gp = g.getGlPort(p.name);
+                    if (!gp) return p.name + ": no glport";
+                    const r = gp.rect;
+                    if (!r) return p.name + ": no rect";
+                    const rd = gui.patchView.patchRenderer.rectDrawer;
+                    const buf = rd ? " buffer size " + rd._attrBuffSizes[r.idx * 2] + "x" + rd._attrBuffSizes[r.idx * 2 + 1] + " pos " + rd._attrBuffPos[r.idx * 3] + "," + rd._attrBuffPos[r.idx * 3 + 1] + "," + rd._attrBuffPos[r.idx * 3 + 2] + " col a " + rd._attrBuffCol[r.idx * 4 + 3] + " shape " + rd._attrBuffDeco[r.idx * 4] : "";
+                    return p.name + ": idx " + r.idx + " x " + r.x + " y " + r.y + " w " + r.w + " h " + r.h + " visible " + r.visible + " absZ " + r.absZ + (p.uiAttribs.hidePort ? " hidePort" : "") + buf;
+                }) : null,
+                "rectDrawerNumRects": gui.patchView.patchRenderer.rectDrawer ? gui.patchView.patchRenderer.rectDrawer.getNumRects() : null,
+                "rectDrawerBufferSize": gui.patchView.patchRenderer.rectDrawer ? gui.patchView.patchRenderer.rectDrawer._attrBuffPos.length / 3 : null,
                 "tidyUpOps": String(gui.patchView.tidyUpOps).substring(0, 300)
             }));
         }
@@ -778,46 +874,15 @@ function buildMcpServer()
         {
             logMcp("add op " + objName);
 
-            if (!gui.opDocs.getOpDocByName(objName) && isCollectionOpName(objName))
-            {
-                try
-                {
-                    await withTimeout(loadCollection(objName), COLLECTION_LOAD_TIMEOUT_MS, "loading the ops of " + objName);
-                }
-                catch (e)
-                {
-                    return respondError("could not load the collection of \"" + objName + "\": " + e.message);
-                }
-            }
-            if (!await loadOpDoc(objName)) return respondError("no op named \"" + objName + "\", find the name with search-ops");
-
-            const placeLater = x === undefined && y === undefined;
-            const uiAttribs = {};
-            if (placeLater) uiAttribs.translate = patchViewCenter();
-            else uiAttribs.translate = { "x": x || 0, "y": y || 0 };
-
             let newOp;
             try
             {
-                newOp = await addOpUndoable(objName, uiAttribs);
+                newOp = await addOpChecked(objName, x, y);
             }
             catch (e)
             {
-                return respondError("could not add op \"" + objName + "\": " + e.message);
+                return respondError(e.message);
             }
-
-            if (!newOp) return respondError("could not add op \"" + objName + "\" (no such op? see search-ops)");
-
-            if (placeLater && gui.patchView.patchRenderer.getGlOp(newOp))
-            {
-                const rect = opRect(newOp);
-                moveToNearestFreeSpot(rect, otherOpRects(newOp, false), true, true);
-                newOp.setUiAttribs({ "translate": { "x": rect.x, "y": rect.y } });
-                unplacedOpIds.add(newOp.id);
-            }
-
-            const opDoc = gui.opDocs.getOpDocByName(objName);
-            if (opDoc && !opDoc.layout) gui.serverOps.saveOpLayout(newOp);
 
             const portsIn = newOp.portsIn.map((p) => p.name);
             const portsOut = newOp.portsOut.map((p) => p.name);
@@ -867,22 +932,37 @@ function buildMcpServer()
 
     server.tool(
         "upload-patch",
-        "upload the current patch json (ops and ui, no op code or asset files) to cables.gl, with the cables.gl api key from the standalone preferences. without projectId a new private patch is created, with it that patch on cables.gl is overwritten. unsaved changes are saved first. fails if the patch uses Ops.Local ops, they do not exist on cables.gl. returns the patch id and its editor url.",
+        "upload the current patch json (ops and ui, no op code or asset files) to cables.gl, with the cables.gl api key from the standalone preferences. without projectId a new private patch is created, with it that patch on cables.gl is overwritten. unsaved changes are saved first. fails if the patch uses Ops.Local ops, they do not exist on cables.gl. this mcp server op and the ops linked to it are left out. description, tags, licence and visibility set the patch settings after uploading. returns the patch id and its editor url.",
         {
             "projectId": z.string().optional().describe("id of a patch on cables.gl to overwrite (from an earlier upload-patch), leave out to create a new one"),
-            "server": z.string().optional().describe("cables server url, e.g. https://dev.cables.gl, default the standalone's configured server (https://cables.gl)")
+            "server": z.string().optional().describe("cables server url, e.g. https://cables.gl, default the standalone's configured communityUrl (cables_electron/cables.json)"),
+            "description": z.string().optional().describe("patch description shown in the patch settings, markdown"),
+            "tags": z.string().optional().describe("comma separated tags/keywords of the patch"),
+            "licence": z.enum(["none", "copyright", "cc0", "cc-by", "cc-by-sa", "cc-by-nd", "cc-by-nc", "cc-by-nc-sa", "cc-by-nc-nd"]).optional().describe("patch licence, cc0 is public domain"),
+            "visibility": z.enum(["private", "unlisted", "public"]).optional().describe("who can see the patch: private, unlisted (anyone with the link) or public"),
+            "name": z.string().optional().describe("patch name on cables.gl, default the current patch title (set-patch-name)")
         },
-        async ({ projectId, server }) =>
+        async ({ projectId, server, description, tags, licence, visibility, name }) =>
         {
             logMcp("upload patch" + (projectId ? " to " + projectId : "") + (server ? " on " + server : ""));
 
+            // When overwriting an existing server patch, omitting `name` must
+            // preserve its server-side title.  The standalone editor title
+            // may belong to a different example and must not overwrite it.
+            const patchSettings = {};
+            if (name !== undefined) patchSettings.name = name;
+            if (description !== undefined) patchSettings.description = description;
+            if (tags !== undefined) patchSettings.tags = tags;
+            if (licence !== undefined) patchSettings.licence = licence;
+            if (visibility !== undefined) patchSettings.visibility = visibility;
+
             try
             {
-                if (!gui.savedState.isSaved) await savePatch();
+                await savePatch();
 
                 const result = await new Promise((resolve, reject) =>
                 {
-                    CABLESUILOADER.talkerAPI.send("uploadPatchToServer", { "projectId": projectId, "server": server }, (err, rslt) =>
+                    CABLESUILOADER.talkerAPI.send("uploadPatchToServer", { "projectId": projectId, "server": server, "settings": patchSettings, "excludeOpIds": Array.from(mcpBranchOpIds()) }, (err, rslt) =>
                     {
                         if (!err && !rslt) reject(new Error("no answer from the standalone, its main process does not know uploadPatchToServer yet, restart the app"));
                         else if (!err) resolve(rslt.data);
@@ -891,7 +971,7 @@ function buildMcpServer()
                     });
                 });
 
-                return respondText((result.created ? "created" : "updated") + " patch " + result.projectId + " on cables.gl: " + result.url);
+                return respondText((result.created ? "created" : "updated") + " patch " + result.projectId + ": " + result.url);
             }
             catch (e)
             {
@@ -984,23 +1064,38 @@ function buildMcpServer()
     );
 
     server.tool(
-        "get-op-docs",
-        "get the documentation of an op by its full op name (objName), e.g. Ops.Gl.Meshes.Circle_v2: summary, description, port documentation, ports layout, libs/dependencies and whether a newer version exists (oldVersion). read it before using an op to know its exact port names.", { "objName": param.opName() },
+        "get-op-summary-doc",
+        "short documentation of an op by its full op name (objName), e.g. Ops.Gl.Meshes.Circle_v2: summary, description and its input and output ports, one per line as \"- name: type - doc\" (select ports list their options). read it before using an op to know its exact port names. get-full-op-docs has the rest (ids, libs, dependencies, raw port layout).", { "objName": param.opName() },
         async ({ objName }) =>
         {
-            logMcp("op docs " + objName);
+            logMcp("op summary doc " + objName);
+
+            await loadOpDoc(objName);
+            const text = getOpSummaryText(objName);
+            if (!text) return respondError("no op docs found for \"" + objName + "\", use search-ops to find op names");
+
+            return respondText(text);
+        }
+    );
+
+    server.tool(
+        "get-full-op-docs",
+        "all documentation of an op by its full op name (objName) as json: summary, description, port documentation, raw ports layout, libs/dependencies, ids and whether a newer version exists (oldVersion). empty fields are left out. for port names and types get-op-summary-doc is enough.", { "objName": param.opName() },
+        async ({ objName }) =>
+        {
+            logMcp("full op docs " + objName);
 
             await loadOpDoc(objName);
             const doc = getOpDocData(objName);
             if (!doc) return respondError("no op docs found for \"" + objName + "\", use search-ops to find op names");
 
-            return respondText(JSON.stringify(doc, null, 1));
+            return respondText(JSON.stringify(doc));
         }
     );
 
     server.tool(
         "list-op-docs",
-        "list all documented ops, one per line as \"name: summary\". optional str filters by name/summary. old versions and hidden ops are left out unless includeOld / includeHidden is true. use get-op-docs for the full documentation of an op. to find an op by topic, search-ops ranks the results better.", { "str": z.string().optional().describe("only list ops whose name or summary contains this text"), "includeOld": z.boolean().optional().describe("also list old op versions, default false"), "includeHidden": z.boolean().optional().describe("also list hidden ops, default false") },
+        "list all documented ops, one per line as \"name: summary\". optional str filters by name/summary. old versions and hidden ops are left out unless includeOld / includeHidden is true. use get-op-summary-doc for the full documentation of an op. to find an op by topic, search-ops ranks the results better.", { "str": z.string().optional().describe("only list ops whose name or summary contains this text"), "includeOld": z.boolean().optional().describe("also list old op versions, default false"), "includeHidden": z.boolean().optional().describe("also list hidden ops, default false") },
         ({ str, includeOld, includeHidden }) =>
         {
             logMcp("list op docs" + (str ? " \"" + str + "\"" : ""));
@@ -1198,6 +1293,7 @@ function buildMcpServer()
     registerScreenshotTools(server);
     registerPatchViewTools(server);
     registerTidyUpTools(server);
+    registerBatchTools(server);
     registerConsoleTools(server);
     registerPatchInfoTools(server);
 
