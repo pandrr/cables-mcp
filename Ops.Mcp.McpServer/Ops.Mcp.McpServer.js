@@ -5,6 +5,9 @@ const https = op.require("node:https");
 const { z } = op.require("zod");
 
 const
+    inRestart = op.inTriggerButton("Restart Server"),
+    inStop = op.inTriggerButton("Stop Server"),
+    inShowLog = op.inTriggerButton("Show Log"),
     outStarted = op.outBoolNum("Started", false),
     outData = op.outObject("Last Request Data"),
     outLog = op.outString("Log", ""),
@@ -168,9 +171,92 @@ function countedRegister(server, registerName)
     };
 }
 
+const LOG_MAX_LINES = 2000;
+const LOG_SCROLL_SLACK = 20;
+const LOG_TAB_TITLE = "MCP Log";
+
+// the log, its tab and the server controls live on window, so they keep working after an op reload and for a deleted op that still runs the server
+window.cablesMcpLog = window.cablesMcpLog || [];
+
 function logStatus(_log)
 {
     outLog.set(_log);
+    const entry = { "time": Date.now(), "text": String(_log) };
+    window.cablesMcpLog.push(entry);
+    if (window.cablesMcpLog.length > LOG_MAX_LINES) window.cablesMcpLog.shift();
+    if (window.cablesMcpLogTab) appendLogLine(window.cablesMcpLogTab, entry);
+}
+
+function logLineElement(entry)
+{
+    const line = document.createElement("div");
+    line.innerText = new Date(entry.time).toLocaleTimeString() + "  " + entry.text;
+    return line;
+}
+
+// keeps following new lines only while the log is scrolled to the bottom
+function appendLogLine(tab, entry)
+{
+    const logEle = tab.mcpLogEle;
+    if (!logEle) return;
+    const atBottom = logEle.scrollTop + logEle.clientHeight >= logEle.scrollHeight - LOG_SCROLL_SLACK;
+    logEle.appendChild(logLineElement(entry));
+    if (logEle.childElementCount > LOG_MAX_LINES) logEle.firstElementChild.remove();
+    if (atBottom) logEle.scrollTop = logEle.scrollHeight;
+}
+
+function showLogTab()
+{
+    gui.maintabPanel.show(true);
+    if (window.cablesMcpLogTab && gui.mainTabs.getTabByTitle(LOG_TAB_TITLE))
+    {
+        gui.mainTabs.activateTab(window.cablesMcpLogTab.id);
+        return;
+    }
+
+    const tab = new CABLES.UI.Tab(LOG_TAB_TITLE, { "icon": "logs", "singleton": true, "padding": true });
+    gui.mainTabs.addTab(tab, true);
+    tab.addButton("Restart Server", () => { if (window.cablesMcpControl) window.cablesMcpControl.restart(); });
+    tab.addButton("Stop Server", () => { if (window.cablesMcpControl) window.cablesMcpControl.stop(); });
+    tab.addButton("Clear", () =>
+    {
+        window.cablesMcpLog.length = 0;
+        tab.mcpLogEle.innerHTML = "";
+    });
+
+    tab.html("<div style=\"height:100%;overflow:auto;font-family:monospace;white-space:pre-wrap;user-select:text;\"></div>");
+    tab.mcpLogEle = tab.contentEle.firstElementChild;
+    for (let i = 0; i < window.cablesMcpLog.length; i++) tab.mcpLogEle.appendChild(logLineElement(window.cablesMcpLog[i]));
+    tab.mcpLogEle.scrollTop = tab.mcpLogEle.scrollHeight;
+
+    tab.on(CABLES.UI.Tab.EVENT_CLOSE, () => { window.cablesMcpLogTab = null; });
+    window.cablesMcpLogTab = tab;
+}
+
+const MENUBAR_ITEM_ID = "nav-item-mcp";
+
+// the op adds its own status icon to the editor's menubar, a click opens the log tab of the current instance
+function menubarItem()
+{
+    let item = document.getElementById(MENUBAR_ITEM_ID);
+    if (item) return item;
+
+    const list = document.querySelector("#menubar nav > ul");
+    if (!list) return null;
+
+    item = document.createElement("li");
+    item.id = MENUBAR_ITEM_ID;
+    item.classList.add("hidden");
+    item.innerHTML = "<span class=\"icon-bot icon tt\" style=\"display:inherit;margin:-3px;\" data-tt=\"MCP server is running, click to show the log\"></span>";
+    item.addEventListener("click", () => { if (window.cablesMcpShowLog) window.cablesMcpShowLog(); });
+    list.appendChild(item);
+    return item;
+}
+
+function showMenubarIcon(running)
+{
+    const item = menubarItem();
+    if (item) item.classList.toggle("hidden", !running);
 }
 
 // every tool call logs through here, the title counts them so it shows the server is still being reached
@@ -981,6 +1067,75 @@ function buildMcpServer()
     );
 
     server.tool(
+        "add-patch-to-patchlist",
+        "add a patch on cables.gl to a patchlist there, with the cables.gl api key from the standalone preferences. the key's user needs write access to the list. adding a patch that is already in the list changes nothing.",
+        {
+            "listId": z.string().describe("id of the patchlist on cables.gl, the last part of its /patchlist/ url"),
+            "projectId": z.string().describe("id of the patch on cables.gl, e.g. the one upload-patch returned"),
+            "server": z.string().optional().describe("cables server url, e.g. https://cables.gl, default the standalone's configured communityUrl (cables_electron/cables.json)")
+        },
+        async ({ listId, projectId, server }) =>
+        {
+            logMcp("add patch " + projectId + " to patchlist " + listId);
+
+            try
+            {
+                const result = await new Promise((resolve, reject) =>
+                {
+                    CABLESUILOADER.talkerAPI.send("addPatchToPatchList", { "listId": listId, "projectId": projectId, "server": server }, (err, rslt) =>
+                    {
+                        if (!err && !rslt) reject(new Error("no answer from the standalone, its main process does not know addPatchToPatchList yet, restart the app"));
+                        else if (!err) resolve(rslt.data);
+                        else reject(new Error(err.msg + (err.data ? ": " + (typeof err.data == "string" ? err.data : JSON.stringify(err.data)) : "")));
+                    });
+                });
+
+                return respondText("added patch " + result.projectId + " to patchlist " + result.listId + ": " + result.url);
+            }
+            catch (e)
+            {
+                return respondError("adding to patchlist failed: " + e.message);
+            }
+        }
+    );
+
+    server.tool(
+        "upload-patch-assets",
+        "upload files from the current patch directory (e.g. ./image.png in file ports) as assets of a patch on cables.gl, with the cables.gl api key from the standalone preferences. upload-patch does not upload asset files, use this afterwards. returns each file's absolute asset url (on the sandbox server, e.g. https://devsandbox.cables.gl/assets/<patch long id>/<filename>); set file ports to it so the patch works in the standalone and on the website, then upload the patch again.",
+        {
+            "projectId": z.string().describe("id of the patch on cables.gl, e.g. the one upload-patch returned"),
+            "files": z.array(z.string()).describe("file names in the patch directory, e.g. [\"reference.png\"], a leading ./ is ignored"),
+            "server": z.string().optional().describe("cables server url, e.g. https://cables.gl, default the standalone's configured communityUrl (cables_electron/cables.json)"),
+            "assetServer": z.string().optional().describe("url the server's assets are served from, e.g. https://sandbox.cables.gl, default the standalone's configured communitySandboxUrl")
+        },
+        async ({ projectId, files, server, assetServer }) =>
+        {
+            logMcp("upload " + files.length + " assets to patch " + projectId);
+
+            try
+            {
+                const result = await new Promise((resolve, reject) =>
+                {
+                    CABLESUILOADER.talkerAPI.send("uploadPatchAssetsToServer", { "projectId": projectId, "files": files, "server": server, "assetServer": assetServer }, (err, rslt) =>
+                    {
+                        if (!err && !rslt) reject(new Error("no answer from the standalone, its main process does not know uploadPatchAssetsToServer yet, restart the app"));
+                        else if (!err) resolve(rslt.data);
+                        else reject(new Error(err.msg + (err.data ? ": " + (typeof err.data == "string" ? err.data : JSON.stringify(err.data)) : "")));
+                    });
+                });
+
+                const lines = [];
+                for (let i = 0; i < result.files.length; i++) lines.push(result.files[i].filename + " -> " + result.files[i].url);
+                return respondText("uploaded " + result.files.length + " files to patch " + result.projectId + ":\n" + lines.join("\n"));
+            }
+            catch (e)
+            {
+                return respondError("asset upload failed: " + e.message);
+            }
+        }
+    );
+
+    server.tool(
         "set-patch-name",
         "rename the current patch (its title), the same as the editor's patch title dialog. the new name is stored right away, no save-patch needed.", { "name": z.string().describe("new title of the patch") },
         async ({ name }) =>
@@ -1410,8 +1565,14 @@ function listen(retriesLeft)
         logStatus(startLog);
         console.log("MCP server listening on http://localhost:" + MCP_PORT + "/mcp");
         outStarted.set(true);
+        op.setUiAttrib({ "extendTitle": "called " + window.cablesMcpCallCount + "x" });
+        showMenubarIcon(true);
     });
 }
+
+// a deleted server op keeps running until another instance takes over, then it closes what is left of it
+if (window.cablesMcpReleaseDeleted) window.cablesMcpReleaseDeleted();
+window.cablesMcpReleaseDeleted = null;
 
 // start capturing right away so messages from before the first get-console-logs call are kept, without the debug port there is nothing to capture
 connectDevTools().catch(() => {});
@@ -1420,9 +1581,37 @@ connectDevTools().catch(() => {});
 op.startMcpServer = () =>
 {
     window.cablesMcpInstance = instanceToken;
+    window.cablesMcpStopped = false;
     stopServer(window.cablesMcpHttpServer).then(() => { listen(LISTEN_MAX_RETRIES); });
 };
-op.startMcpServer();
+
+// a stopped server stays stopped, also when the op is reloaded or added again, until Restart Server is pressed
+function stopMcpServer()
+{
+    window.cablesMcpStopped = true;
+    window.cablesMcpInstance = null;
+    outStarted.set(false);
+    op.setUiAttrib({ "extendTitle": "stopped" });
+    showMenubarIcon(false);
+
+    const server = window.cablesMcpHttpServer;
+    window.cablesMcpHttpServer = null;
+    stopServer(server).then(() => { logStatus("mcp server stopped"); });
+}
+
+window.cablesMcpControl = { "stop": stopMcpServer, "restart": op.startMcpServer };
+window.cablesMcpShowLog = showLogTab;
+
+inStop.onTriggered = stopMcpServer;
+inRestart.onTriggered = op.startMcpServer;
+inShowLog.onTriggered = showLogTab;
+
+if (window.cablesMcpStopped)
+{
+    op.setUiAttrib({ "extendTitle": "stopped" });
+    logStatus("mcp server is stopped, press Restart Server to start it");
+}
+else op.startMcpServer();
 
 function checkSingleServerOp()
 {
@@ -1435,18 +1624,46 @@ const opAddedListener = op.patch.on(CABLES.Patch.EVENT_OP_ADDED, checkSingleServ
 const opDeletedListener = op.patch.on(CABLES.Patch.EVENT_OP_DELETED, checkSingleServerOp);
 checkSingleServerOp();
 
-// when the running server op is deleted (not reloaded) another server op in the patch takes over
+function closeDevTools()
+{
+    if (devToolsSocket) devToolsSocket.close();
+}
+
+// the editor emits this after it executed changed op code, newOp is empty when no instance of the op is in the patch
+const EVENT_OP_RELOADED = "opReloaded";
+
+// a deleted op still running the server would keep the old code, so it adds itself again, the new instance takes over with the new code
+function onCodeChangedWhileDeleted(name, newOp)
+{
+    if (name != op.objName || newOp || !isCurrentInstance()) return;
+    logStatus("mcp server code changed, adding the op again to load it");
+    op.patch.addOp(op.objName, { "translate": op.uiAttribs.translate, "subPatch": op.uiAttribs.subPatch });
+}
+
+// deleting the op (e.g. clearing the patch) keeps its server running, only an op reload replaces it with the new instance
 op.onDelete = (reloadingOp) =>
 {
-    const wasRunning = isCurrentInstance();
-    logStatus("stop mcp server");
-    if (window.cablesMcpHttpServer === httpServer) window.cablesMcpHttpServer = null;
-    if (isCurrentInstance()) window.cablesMcpInstance = null;
     op.patch.off(opAddedListener);
     op.patch.off(opDeletedListener);
 
-    const otherServerOps = op.patch.getOpsByObjName(op.objName);
-    if (wasRunning && !reloadingOp && otherServerOps.length > 0 && otherServerOps[0].startMcpServer) otherServerOps[0].startMcpServer();
-    if (devToolsSocket) devToolsSocket.close();
+    if (!reloadingOp)
+    {
+        if (isCurrentInstance() && window.cablesMcpHttpServer === httpServer)
+        {
+            logStatus("mcp server op deleted, the server keeps running");
+            const codeListener = op.patch.on(EVENT_OP_RELOADED, (name, newOp) => { onCodeChangedWhileDeleted(name, newOp); });
+            window.cablesMcpReleaseDeleted = () =>
+            {
+                op.patch.off(codeListener);
+                closeDevTools();
+            };
+        }
+        else closeDevTools();
+        return;
+    }
+
+    if (window.cablesMcpHttpServer === httpServer) window.cablesMcpHttpServer = null;
+    if (isCurrentInstance()) window.cablesMcpInstance = null;
+    closeDevTools();
     stopServer(httpServer).then(() => { console.log("Server closed"); });
 };

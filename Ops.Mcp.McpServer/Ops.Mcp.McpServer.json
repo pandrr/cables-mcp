@@ -14,7 +14,20 @@
         }
     ],
     "layout": {
-        "portsIn": [],
+        "portsIn": [
+            {
+                "type": 1,
+                "name": "Restart Server"
+            },
+            {
+                "type": 1,
+                "name": "Stop Server"
+            },
+            {
+                "type": 1,
+                "name": "Show Log"
+            }
+        ],
         "portsOut": [
             {
                 "type": 0,
