@@ -8,6 +8,37 @@ function splitPortRef(ref)
     return { "ref": ref.substring(0, dot), "portName": ref.substring(dot + 1) };
 }
 
+// resolves "key.Port" or "opId.Port" to op id and port name, keys come from batch-add-ops
+function resolvePortRef(ref, idByKey)
+{
+    const p = splitPortRef(ref);
+    if (!p) throw new Error("\"" + ref + "\" is not \"key.Port\" or \"opId.Port\"");
+    const opId = idByKey[p.ref] || (CABLES.patch.getOpById(p.ref) ? p.ref : null);
+    if (!opId) throw new Error("\"" + p.ref + "\" in \"" + ref + "\" is neither a key nor an op id");
+    return { "opId": opId, "portName": p.portName };
+}
+
+// links a list of {from, to} port refs, returns the number of links made, failures go to errors
+function linkPortRefs(links, idByKey, errors)
+{
+    let numLinked = 0;
+    for (const l of links)
+    {
+        try
+        {
+            const from = resolvePortRef(l.from, idByKey);
+            const to = resolvePortRef(l.to, idByKey);
+            linkPortsChecked(from.opId, from.portName, to.opId, to.portName);
+            numLinked++;
+        }
+        catch (e)
+        {
+            errors.push(l.from + " -> " + l.to + ": " + e.message);
+        }
+    }
+    return numLinked;
+}
+
 // moves an op as one undo step, the same as move-op
 function moveOpUndoable(opId, x, y)
 {
@@ -31,8 +62,8 @@ function moveOpUndoable(opId, x, y)
 function registerBatchTools(server)
 {
     server.tool(
-        "build-ops",
-        "add several ops with their port values and comments and link them, in one call. each op gets a key you choose; links are \"key.Port\" -> \"key.Port\", a key can also be the id of an op already in the patch. all op names are checked first, nothing is added if one is unknown. other errors (wrong port, incompatible link) are reported and the rest is still built. tidy (default true) arranges the new ops like tidy-up-ops. returns the new op ids per key.",
+        "batch-add-ops",
+        "add several ops in one call, with their port values, comments and the links between them. use it instead of many add-op, set-port-value and link-ports calls. give each op a key and write links as \"key.Port\" -> \"key.Port\"; the id of an op already in the patch works in place of a key. op names are checked first: if one is unknown nothing is added. other failures (wrong port name, incompatible link) are listed and the rest is still built. the new ops are arranged like tidy-up-ops unless tidy is false. returns the op id for each key.",
         {
             "ops": z.array(z.object({
                 "key": z.string().describe("your name for the op, used in links, e.g. \"lfo\""),
@@ -97,30 +128,7 @@ function registerBatchTools(server)
                 if (o.comment) setOpCommentUndoable(opId, o.comment);
             }
 
-            const resolve = (ref) =>
-            {
-                const p = splitPortRef(ref);
-                if (!p) throw new Error("\"" + ref + "\" is not \"key.Port\"");
-                const opId = idByKey[p.ref] || (CABLES.patch.getOpById(p.ref) ? p.ref : null);
-                if (!opId) throw new Error("\"" + p.ref + "\" in \"" + ref + "\" is neither a key nor an op id");
-                return { "opId": opId, "portName": p.portName };
-            };
-
-            let numLinked = 0;
-            for (const l of links || [])
-            {
-                try
-                {
-                    const from = resolve(l.from);
-                    const to = resolve(l.to);
-                    linkPortsChecked(from.opId, from.portName, to.opId, to.portName);
-                    numLinked++;
-                }
-                catch (e)
-                {
-                    errors.push(l.from + " -> " + l.to + ": " + e.message);
-                }
-            }
+            const numLinked = linkPortRefs(links || [], idByKey, errors);
 
             let tidyText = "";
             if (tidy !== false && added.length)
@@ -145,8 +153,30 @@ function registerBatchTools(server)
     );
 
     server.tool(
-        "set-port-values",
-        "set several input port values in one call, each like set-port-value. every value is set even if others fail, failures are listed.",
+        "batch-link-ports",
+        "link several ports of ops already in the patch in one call, each like link-ports. ports are written as \"opId.Port\", e.g. \"a1b2c3d4e.Result\". every link is tried even if others fail, failures are listed.",
+        {
+            "links": z.array(z.object({
+                "from": z.string().describe("output port as \"opId.Port\""),
+                "to": z.string().describe("input port as \"opId.Port\"")
+            })).describe("links to create, in order")
+        },
+        ({ links }) =>
+        {
+            logMcp("link " + links.length + " ports");
+
+            const errors = [];
+            const numLinked = linkPortRefs(links, {}, errors);
+
+            const text = "linked " + numLinked + " of " + links.length;
+            if (errors.length) return respondText(text + "\nerrors:\n" + errors.join("\n"));
+            return respondText(text);
+        }
+    );
+
+    server.tool(
+        "batch-set-port-values",
+        "set several input port values in one call, each like set-port-value. every value is tried even if others fail, failures are listed.",
         {
             "values": z.array(z.object({
                 "opId": param.opId(),
@@ -178,8 +208,8 @@ function registerBatchTools(server)
     );
 
     server.tool(
-        "move-ops",
-        "move several ops to new patch coordinates in one call, as one undo step. use it after tidy-up-ops when the layout needs fixing, check-layout tells what overlaps.",
+        "batch-move-ops",
+        "move several ops to new patch coordinates in one call, as one undo step. only for fixing the layout after tidy-up-ops; check-layout lists what overlaps.",
         {
             "positions": z.array(z.object({
                 "opId": param.opId(),

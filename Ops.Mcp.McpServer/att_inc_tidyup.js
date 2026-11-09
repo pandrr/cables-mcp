@@ -286,7 +286,7 @@ function registerTidyUpTools(server)
 {
     server.tool(
         "check-layout",
-        "check the patch field layout as text instead of a screenshot: lists ops whose boxes or comments overlap, links going up (the input op is not below the output op) and links running behind other ops (approximated as straight lines). checks the ops of the current subpatch, or only opIds. fix problems with move-ops or tidy-up-ops.", { "opIds": z.array(param.opId()).optional().describe("only check these ops, default all ops of the current subpatch") },
+        "check the patch field layout as text instead of a screenshot: lists ops whose boxes or comments overlap, links going up (the input op is not below the output op) and links running behind other ops (approximated as straight lines). checks the ops of the current subpatch, or only opIds. fix problems with batch-move-ops or tidy-up-ops.", { "opIds": z.array(param.opId()).optional().describe("only check these ops, default all ops of the current subpatch") },
         ({ opIds }) =>
         {
             logMcp("check layout");

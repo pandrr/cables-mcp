@@ -31,8 +31,8 @@ const SERVER_INSTRUCTIONS = [
     "workflow to build or change something in the patch:",
     "1. get-patch-overview to see what is already there.",
     "2. search-ops to find ops, get-op-summary-doc for their ports (or load-example-patch to see an op in use).",
-    "3. add-op without x/y, then link-ports and set-port-value.",
-    "4. tidy-up-ops once with the ids of all ops you added.",
+    "3. batch-add-ops to add several ops with their values and links in one call (arranged automatically). for single changes add-op without x/y, link-ports, set-port-value, then tidy-up-ops once with the ids of all ops you added.",
+    "4. batch-set-port-values and batch-link-ports to change many values or links of existing ops in one call.",
     "5. check the result: get-patch-errors, screenshot for the webgl canvas, inspect-element-port for html elements and 2d canvases.",
     "6. save-patch.",
     "",
@@ -156,6 +156,17 @@ function countCall(name)
     outStats.setRef(stats);
 }
 
+// every tool call creates a heavy event, so it is visible (e.g. in the Performance op) that something is happening
+function emitHeavyEvent(toolName)
+{
+    try
+    {
+        const cgl = op.patch.cgl;
+        if (cgl && cgl.profileData) cgl.profileData.addHeavyEvent("mcp tool", toolName);
+    }
+    catch (e) {}
+}
+
 // wraps a register function so every call of the registered handler (always the last argument) is counted under its name
 function countedRegister(server, registerName)
 {
@@ -166,6 +177,7 @@ function countedRegister(server, registerName)
         return register(name, ...args, (...handlerArgs) =>
         {
             countCall(name);
+            if (registerName == "tool") emitHeavyEvent(name);
             return handler(...handlerArgs);
         });
     };
@@ -300,6 +312,13 @@ function respond(data)
 {
     outData.setRef({ "data": data });
     return data;
+}
+
+// palette commands plus the dynamic ones that open tabs add, i.e. the op tests commands
+function getAllCommands()
+{
+    const dynamic = gui.cmdPalette && gui.cmdPalette.dynamicCmds ? gui.cmdPalette.dynamicCmds : [];
+    return CABLES.CMD.commands.concat(dynamic);
 }
 
 function respondText(text)
@@ -955,7 +974,7 @@ function buildMcpServer()
 
     server.tool(
         "add-op",
-        "add a new op to the current patch by its full op name (objName), e.g. Ops.Anim.Timer_v2; get valid names from search-ops. extension and team ops (Ops.Extension.*, Ops.Team.*) are found by search-ops only as their collection until it is loaded: add-op with the full op name loads it. returns the new op's id (use it with link-ports / set-port-value) and its port names. leave x/y out: link-ports then places the op below the op linked to its input (or above the op it feeds), cables flow from top to bottom. only give x/y when the user asks for a position. when adding several ops, call tidy-up-ops with all new op ids at the end.", { "objName": param.opName(), "x": z.number().optional().describe("only when the user asks for a position: x in patch coordinates"), "y": z.number().optional().describe("only when the user asks for a position: y in patch coordinates") },
+        "add a new op to the current patch by its full op name (objName), e.g. Ops.Anim.Timer_v2; get valid names from search-ops. extension and team ops (Ops.Extension.*, Ops.Team.*) are found by search-ops only as their collection until it is loaded: add-op with the full op name loads it. returns the new op's id (use it with link-ports / set-port-value) and its port names. leave x/y out: link-ports then places the op below the op linked to its input (or above the op it feeds), cables flow from top to bottom. only give x/y when the user asks for a position. to add several ops use batch-add-ops instead.", { "objName": param.opName(), "x": z.number().optional().describe("only when the user asks for a position: x in patch coordinates"), "y": z.number().optional().describe("only when the user asks for a position: y in patch coordinates") },
         async ({ objName, x, y }) =>
         {
             logMcp("add op " + objName);
@@ -1164,7 +1183,7 @@ function buildMcpServer()
             logMcp("list commands" + (str ? " \"" + str + "\"" : ""));
 
             const filter = (str || "").toLowerCase();
-            const cmds = CABLES.CMD.commands
+            const cmds = getAllCommands()
                 .filter((c) => c && c.func)
                 .filter((c) => !filter || ((c.cmd || "") + " " + (c.category || "") + " " + (c.infotext || "")).toLowerCase().indexOf(filter) > -1)
                 .map((c) => ({ "name": c.cmd, "category": c.category, "description": c.infotext }));
@@ -1180,13 +1199,13 @@ function buildMcpServer()
         {
             logMcp("run command \"" + name + "\"");
 
-            const cmd = CABLES.CMD.commands.find((c) => c && c.cmd == name);
+            const cmd = getAllCommands().find((c) => c && c.cmd == name);
             if (!cmd || !cmd.func) return respondError(cmd ? "command \"" + name + "\" has no function" : "no command named \"" + name + "\", use list-commands");
 
             try
             {
-                await cmd.func();
-                return respondText("executed command " + name);
+                const result = await cmd.func();
+                return respondText("executed command " + name + (typeof result == "string" && result ? "\n" + result : ""));
             }
             catch (e)
             {

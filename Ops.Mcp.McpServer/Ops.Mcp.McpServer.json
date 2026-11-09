@@ -3,6 +3,7 @@
     "created": 1785567425892,
     "license": "MIT",
     "authorName": "pandur",
+    "flags": "genAi",
     "dependencies": [
         {
             "src": "@modelcontextprotocol/sdk",
