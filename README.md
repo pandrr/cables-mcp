@@ -9,24 +9,48 @@ cables mcp server as an operator. this enables communication of an llm/ai with t
 - the ai can change, delete and save your patch and your op code. keep backups.
 - the server listens on port `3000` without any authentication, and on all network interfaces. anyone who can reach that port on your machine can control the editor. only run it on a trusted network.
 
-### how to install op
+### installation
 
-- check out this repository
-- start cables standalone (min v0.11.1 or self build)
-- add folder of this repository as an op dir
-- you should be able to use McpServer op now, add it to your patch
+the McpServer op is included in the [cables standalone](https://cables.gl/standalone), there is nothing to install. all you need to do is set up your client (the ai tool that should talk to the editor), see [setup](#setup).
+
+- add the McpServer op to your patch, the server starts with it
 - the op output `Started` shows if the server is running, `Log` shows the latest request
 - the op title shows how often it was called (e.g. "called 12x"), so you can see that a client is still connected
 - the op output `Stats` is an object with the number of calls per tool, the total, the last tool and when it was called, e.g. link it to `Ops.Ui.VizObject`. the counts are kept until the editor reloads
 - open op code editor by pressing [e] and then you should be able to chat about this code
 
-### add mcp server to terminal claude code
+this repository is the source of the op. to work on the op itself or to use a newer version than the one in your standalone, add the folder of this repository as an op dir in a self built standalone.
 
-```
-claude mcp add --transport http cables http://localhost:3000/mcp
-```
+### setup
 
-any other mcp client that supports http transport works the same, the endpoint is `http://localhost:3000/mcp`.
+the mcp server is not a separate program: it runs inside the editor, as the McpServer op, and listens on `http://localhost:3000/mcp` (streamable http transport, no authentication). so a client can only use it if it can open a http connection to that address, and the editor has to be running with the op in the patch.
+
+there are two kinds of clients:
+
+- **local clients** run on your machine (or a vm/container that can reach it) and connect from there: terminal agents (claude code, codex cli, gemini cli), editors and ide extensions (cursor, vs code, windsurf, cline, zed) and the desktop apps that can talk to local servers. these work.
+- **cloud clients** make the connection from the provider's servers, not from your computer: the chat websites and their "connectors" (chatgpt, claude.ai web), and the remote mcp tool of the openai and anthropic apis. `localhost` means the provider's machine there, so these can **not** reach the editor.
+
+setup of the common local clients (config formats change between versions, check the docs of your client if one does not work):
+
+| client | setup |
+|---|---|
+| claude code | `claude mcp add --transport http cables http://localhost:3000/mcp` (add `--scope project` to write a `.mcp.json` into the project) |
+| codex cli | in `~/.codex/config.toml`: `[mcp_servers.cables]` with `url = "http://localhost:3000/mcp"` (older versions only support stdio servers and need the bridge below) |
+| gemini cli | in `~/.gemini/settings.json`: `"mcpServers": { "cables": { "httpUrl": "http://localhost:3000/mcp" } }` |
+| cursor | in `.cursor/mcp.json` or `~/.cursor/mcp.json`: `"mcpServers": { "cables": { "url": "http://localhost:3000/mcp" } }` |
+| vs code (copilot) | in `.vscode/mcp.json`: `"servers": { "cables": { "type": "http", "url": "http://localhost:3000/mcp" } }` |
+| any other client with http support | url `http://localhost:3000/mcp`, transport "http" / "streamable http" |
+| clients with stdio only (e.g. `claude_desktop_config.json` of claude desktop) | use a bridge: `"cables": { "command": "npx", "args": ["-y", "mcp-remote", "http://localhost:3000/mcp", "--allow-http"] }` |
+
+if the client runs somewhere else than the editor (a vm, a container, another machine), `localhost` is that other machine. forward the port, e.g. `ssh -N -L 3000:localhost:3000 user@editor-host`, or use the address of the editor machine, but remember that the server has no authentication (see above).
+
+#### openai (chatgpt, responses api) and the local requirement
+
+chatgpt (apps/connectors, developer mode) and the remote mcp tool of the openai responses api are called **by openai's servers**. they need a public https url and cannot reach `http://localhost:3000`. this is why with openai products you have to use a local client instead: **codex cli** (or the codex ide extension), or any other local agent that supports mcp. these run on your machine, so they reach the editor directly.
+
+the native chat apps (chatgpt, claude.ai in the browser) therefore do not work, even when the desktop app is installed on the same machine, as long as the mcp connection is made by the provider's cloud. a desktop app only works if it has its own local mcp support (config file or "add local server"), then it behaves like the clients in the table above.
+
+exposing the editor through a public tunnel (ngrok, cloudflared) would make cloud clients work technically, but the server has **no authentication and can run code in your editor**: anyone who finds the url controls your patch and your op code. do not do it without putting authentication in front of it.
 
 ### reading console logs
 
@@ -70,10 +94,16 @@ some clients don't expose resources to the ai, so they can also be used with the
 | `get-patch-overview` | compact overview: one line per op with id, name, title, subpatch and links, optionally with changed port values |
 | `get-unreleased-op-ids` | compact JSON list of current-patch op instance ids whose documented ops are unreleased |
 | `get-patch-op` | one op from the patch as json: port values, uiAttribs, storage, links |
+| `get-port-values` | current runtime values of all input and output ports of an op, including linked ports, to check what flows through a link |
 | `get-patch-errors` | ops with errors/warnings (shader errors, missing links, wrong types) and code diagnostics |
 | `add-op` | add an op by its full name, optionally at a position |
 | `delete-op` | delete an op and its links |
 | `set-port-value` | set the value of an input port |
+| `batch-add-ops` | add several ops in one call with port values, comments and the links between them (names are checked first) |
+| `batch-set-port-values` | set several input port values in one call, failures are listed |
+| `batch-link-ports` | link several ports in one call, failures are listed |
+| `copy-paste-ops` | copy and paste ops like ctrl+c / ctrl+v, links between the copied ops are kept |
+| `set-op-stacked` | stack or unstack ops inside a loop area that allows stacking |
 | `trigger-port` | trigger a trigger port directly |
 | `link-ports` | link an output port to an input port |
 | `unlink-ports` | remove a link |
@@ -92,8 +122,9 @@ some clients don't expose resources to the ai, so they can also be used with the
 |---|---|
 | `load-patch-json` | download a public patch by id, short id or url and add its ops to the current subpatch, like pasting them |
 | `load-example-patch` | the same with the example patch of an op, by op name (falls back to the example of an older version) |
-
 | `upload-patch` | upload the current patch json (ops and ui, no op code or assets) to cables.gl as a new private patch, or overwrite one with `projectId`; `server` picks another server, e.g. `https://dev.cables.gl` |
+| `upload-patch-assets` | upload files from the patch directory as assets of a patch on cables.gl, use it after `upload-patch` (which does not upload assets) |
+| `add-patch-to-patchlist` | add a patch on cables.gl to a patchlist there |
 
 file ports pointing at `/assets/...` are rewritten to load from `https://devsandbox.cables.gl/assets/...`. ops that are not available locally (e.g. user or patch ops) are left out and reported. `clear` deletes all ops first, like `clear-patch`.
 
@@ -109,6 +140,8 @@ file ports pointing at `/assets/...` are rewritten to load from `https://devsand
 | `select-op` | select ops, like clicking them |
 | `bookmark-op` | bookmark an op or remove its bookmark (stored with the patch) |
 | `move-op` | move an op in the patch field |
+| `batch-move-ops` | move several ops in one call, one undo step |
+| `check-layout` | check the layout as text: overlapping ops and comments, links going up, links running behind ops |
 | `tidy-up-ops` | arrange the selected ops in rows following their links (undoable) |
 | `timeline-screenshot` | screenshot of the timeline panel |
 
@@ -138,7 +171,8 @@ an animation can be reused: animate the `Value` port of `Ops.TimeLine.Anim` and 
 |---|---|
 | `search-ops` | search all available ops by name and summary |
 | `list-op-docs` | list all documented ops |
-| `get-op-docs` | docs of an op: summary, description, ports, dependencies, newer versions |
+| `get-op-summary-doc` | short docs of an op: summary, description and ports, one per line |
+| `get-full-op-docs` | all docs of an op as json: ports layout, libs/dependencies, ids, newer versions |
 | `read-op` | read op code with line numbers, or a range of lines, or only lines containing a text (also searches the op's `att_inc_*.js` includes, with file names) |
 | `edit-op-text` | change op code by replacing a text, the op is saved and re-executed |
 | `edit-op` | open an op in a code editor tab, so the person at the editor sees it |
@@ -146,6 +180,7 @@ an animation can be reused: animate the `Value` port of `Ops.TimeLine.Anim` and 
 | `rename-op` | rename an op or move it to another namespace, its instances in the patch are replaced (standalone only) |
 | `clone-op` | copy an op to a new name or a new version (e.g. `_v2`), optionally replacing it in the patch |
 | `set-op-summary` | set the one line summary of an op |
+| `add-op-changelog` | add an entry to the changelog of an op |
 | `list-op-attachments` | list the attachment files of an op |
 | `read-op-attachment` | read an attachment |
 | `write-op-attachment` | write or create an attachment |
@@ -188,6 +223,7 @@ the op code is split into include attachments (`att_inc_*.js`), they are put in 
 |---|---|
 | `Ops.Mcp.McpServer.js` | ports, shared helpers, call stats, resources and the remaining tools (ports, links, ops, saving, uploading, commands, op docs, profilers, build info, reload), `buildMcpServer`, the http server |
 | `att_inc_anim.js` | timeline, animated ports, keyframes and easings |
+| `att_inc_batch.js` | the batch tools: adding, linking, moving ops and setting port values in one call |
 | `att_inc_console.js` | `get-console-logs`: the editor console via the devtools protocol |
 | `att_inc_opfiles.js` | reading, editing, creating, renaming and cloning op code, attachments and dependencies |
 | `att_inc_patchinfo.js` | patch errors, the patch overview, a single patch op |
