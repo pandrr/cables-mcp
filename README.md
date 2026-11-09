@@ -2,8 +2,6 @@
 
 cables mcp server as an operator. this enables communication of an llm/ai with the cables editor directly: reading and changing patches, writing op code, taking screenshots, running editor commands and more.
 
-> **note:** the McpServer op and this readme were mostly written by an AI (Claude, by Anthropic, using Claude Code), directed, tested and reviewed by pandur.
-
 ### USE WITH CAUTION
 
 - the ai can change, delete and save your patch and your op code. keep backups.
@@ -34,7 +32,7 @@ setup of the common local clients (config formats change between versions, check
 
 | client | setup |
 |---|---|
-| claude code | `claude mcp add --transport http cables http://localhost:3000/mcp` (add `--scope project` to write a `.mcp.json` into the project) |
+| claude code | run on cli: `claude mcp add --transport http cables http://localhost:3000/mcp` (add `--scope project` to write a `.mcp.json` into the project) |
 | codex cli | in `~/.codex/config.toml`: `[mcp_servers.cables]` with `url = "http://localhost:3000/mcp"` (older versions only support stdio servers and need the bridge below) |
 | gemini cli | in `~/.gemini/settings.json`: `"mcpServers": { "cables": { "httpUrl": "http://localhost:3000/mcp" } }` |
 | cursor | in `.cursor/mcp.json` or `~/.cursor/mcp.json`: `"mcpServers": { "cables": { "url": "http://localhost:3000/mcp" } }` |
@@ -237,3 +235,7 @@ the op code is split into include attachments (`att_inc_*.js`), they are put in 
 an include must not use constants of the main op code at the top level, only inside functions. the `register...Tools` functions run while the server is built, so constants they use in tool descriptions or schemas have to be declared before `buildMcpServer()` is called, or in an include.
 
 changing includes and main code at once is not possible with single edits: write new functions to an include first (a function declared twice is fine, the one in the main code wins), then remove them from the main code. a constant declared twice is a syntax error.
+
+
+
+ **note:** the McpServer op and this readme were mostly written by an AI (Claude, by Anthropic, using Claude Code), directed, tested and reviewed by pandur.
