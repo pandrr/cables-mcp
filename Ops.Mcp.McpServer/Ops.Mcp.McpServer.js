@@ -1392,7 +1392,12 @@ function buildMcpServer()
                 else return respondError("not reloading: the patch has unsaved changes, call again with unsaved \"save\" or \"discard\"");
             }
 
-            setTimeout(() => { cmd.func(); }, RELOAD_EDITOR_DELAY_MS);
+            setTimeout(() =>
+            {
+                // the running patch can mark itself unsaved again before the page unloads, the leave dialog would block the editor and this server
+                if (unsaved) gui.savedState.leaving = true;
+                cmd.func();
+            }, RELOAD_EDITOR_DELAY_MS);
             return respondText(JSON.stringify({ "reloading": true, "serverStarted": window.cablesMcpServerStarted }));
         }
     );
