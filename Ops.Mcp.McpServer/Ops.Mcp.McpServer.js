@@ -167,6 +167,25 @@ function emitHeavyEvent(toolName)
     catch (e) {}
 }
 
+// set once per editor window: an op reload keeps it, a full editor reload starts a new one
+window.cablesMcpEditorStarted = window.cablesMcpEditorStarted || Date.now();
+const EDITOR_STARTED_KEY = "cablesMcpEditorStarted";
+
+// the first tool call after a full editor reload gets a note, so the client knows unsaved changes are gone
+function reloadNote()
+{
+    const started = String(window.cablesMcpEditorStarted);
+    let last = null;
+    try
+    {
+        last = localStorage.getItem(EDITOR_STARTED_KEY);
+        localStorage.setItem(EDITOR_STARTED_KEY, started);
+    }
+    catch (e) { return null; }
+    if (!last || last == started) return null;
+    return "note: the editor was reloaded since the last tool call. changes that were not saved before are gone, check the patch again (get-patch-overview).";
+}
+
 // wraps a register function so every call of the registered handler (always the last argument) is counted under its name
 function countedRegister(server, registerName)
 {
@@ -174,11 +193,16 @@ function countedRegister(server, registerName)
     server[registerName] = (name, ...args) =>
     {
         const handler = args.pop();
-        return register(name, ...args, (...handlerArgs) =>
+        return register(name, ...args, async (...handlerArgs) =>
         {
             countCall(name);
-            if (registerName == "tool") emitHeavyEvent(name);
-            return handler(...handlerArgs);
+            if (registerName != "tool") return handler(...handlerArgs);
+
+            emitHeavyEvent(name);
+            const note = reloadNote();
+            const result = await handler(...handlerArgs);
+            if (note && result && Array.isArray(result.content)) result.content.unshift({ "type": "text", "text": note });
+            return result;
         });
     };
 }
@@ -250,8 +274,10 @@ const MENUBAR_ITEM_ID = "nav-item-mcp";
 // the op adds its own status icon to the editor's menubar, a click opens the log tab of the current instance
 function menubarItem()
 {
+    // an item made by older op code (without the call count) is replaced
     let item = document.getElementById(MENUBAR_ITEM_ID);
-    if (item) return item;
+    if (item && item.querySelector(".mcp-calls")) return item;
+    if (item) item.remove();
 
     const list = document.querySelector("#menubar nav > ul");
     if (!list) return null;
@@ -259,9 +285,10 @@ function menubarItem()
     item = document.createElement("li");
     item.id = MENUBAR_ITEM_ID;
     item.classList.add("hidden");
-    item.innerHTML = "<span class=\"icon-bot icon tt\" style=\"display:inherit;margin:-3px;\" data-tt=\"MCP server is running, click to show the log\"></span>";
+    item.innerHTML = "<span class=\"icon-bot icon tt\" style=\"display:inherit;margin:-3px;\" data-tt=\"MCP server is running, highlighted while a client is connected, the number counts tool calls, click to show the log\"></span><span class=\"mcp-calls\" style=\"margin-left:6px;\"></span>";
     item.addEventListener("click", () => { if (window.cablesMcpShowLog) window.cablesMcpShowLog(); });
     list.appendChild(item);
+    updateMenubarCalls();
     return item;
 }
 
@@ -271,12 +298,46 @@ function showMenubarIcon(running)
     if (item) item.classList.toggle("hidden", !running);
 }
 
+// the number of tool calls stays visible while a client is connected, so after looking away it shows whether something happened
+function updateMenubarCalls()
+{
+    const item = document.getElementById(MENUBAR_ITEM_ID);
+    if (item) item.querySelector(".mcp-calls").innerText = window.cablesMcpCallCount && window.cablesMcpStreams > 0 ? window.cablesMcpCallCount + "x" : "";
+}
+
+// a connected client keeps a GET stream open, the icon is highlighted while there is one
+window.cablesMcpStreams = window.cablesMcpStreams || 0;
+
+function updateMenubarConnected()
+{
+    const item = menubarItem();
+    if (item) item.querySelector(".icon-bot").classList.toggle("icon-highlight", window.cablesMcpStreams > 0);
+    updateMenubarCalls();
+}
+
 // every tool call logs through here, the title counts them so it shows the server is still being reached
 function logMcp(_log)
 {
     window.cablesMcpCallCount++;
     logStatus(_log);
     op.setUiAttrib({ "extendTitle": "called " + window.cablesMcpCallCount + "x" });
+    updateMenubarCalls();
+    showMenubarCallsActivity();
+}
+
+const CALLS_FADE_DELAY = 20000;
+
+// the call number is shown on activity and fades out after a while without tool calls
+function showMenubarCallsActivity()
+{
+    const item = document.getElementById(MENUBAR_ITEM_ID);
+    if (!item) return;
+    const ele = item.querySelector(".mcp-calls");
+    ele.style.transition = "opacity 1s";
+    ele.style.opacity = 1;
+
+    clearTimeout(window.cablesMcpCallsFadeTimeout);
+    window.cablesMcpCallsFadeTimeout = setTimeout(() => { ele.style.opacity = 0; }, CALLS_FADE_DELAY);
 }
 
 // the log port starts with this line instead of "", relinking after an op reload copies the current value to the logger
@@ -423,8 +484,10 @@ function setPortValueChecked(opId, portName, value)
     if (port.getType() == CABLES.Port.TYPE_STRING && value !== null && typeof value == "object") value = JSON.stringify(value);
     if (port.getType() == CABLES.Port.TYPE_STRING && (typeof value == "number" || typeof value == "boolean")) value = String(value);
 
+    // setters create a new variable / named trigger when given a new name
+    const createsName = (port.uiAttribs._variableSelect && !port.uiAttribs._variableSelectGet) || (port.uiAttribs._triggerSelect && targetOp.objName.indexOf("Ops.Trigger.TriggerSend") == 0);
     const options = port.uiAttribs.values;
-    if (Array.isArray(options) && (port.uiAttribs.display == "dropdown" || port.uiAttribs.display == "switch"))
+    if (!createsName && Array.isArray(options) && (port.uiAttribs.display == "dropdown" || port.uiAttribs.display == "switch"))
     {
         let known = false;
         for (let i = 0; i < options.length; i++) if (String(options[i]) == String(value)) known = true;
@@ -1500,6 +1563,17 @@ const httpServer = http.createServer(async (req, res) =>
     {
         res.writeHead(404).end();
         return;
+    }
+
+    if (req.method == "GET")
+    {
+        window.cablesMcpStreams++;
+        updateMenubarConnected();
+        res.on("close", () =>
+        {
+            window.cablesMcpStreams--;
+            updateMenubarConnected();
+        });
     }
 
     const mcpServer = buildMcpServer();
